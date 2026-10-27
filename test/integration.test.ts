@@ -13,6 +13,13 @@ import * as path from "node:path";
 
 import init from "../index.ts";
 
+import {
+  archive,
+  drain,
+  readPosts,
+  resolvePaths,
+} from "../src/store.ts";
+
 interface Recorded {
   tools: Map<string, any>;
   handlers: Map<string, Function>;
@@ -139,6 +146,38 @@ test("an explicit cap is enforced and reports the limit", async () => {
   const third = await call(ext, "rooms_post", { room: "b", message: "three" }, "/work/x");
   assert.equal(third.isError, true);
   assert.match(third.content[0].text, /Send budget reached \(2\/2/);
+});
+
+test("reply_all from a room message posts into the room history", async () => {
+  const dir = base();
+  const lead = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "lead" });
+  await call(lead, "rooms_create", { room: "tri", members: ["core"] }, "/work/tri");
+  const posted = await call(lead, "rooms_post", { room: "tri", message: "who owns the migration?" }, "/work/tri");
+  assert.match(posted.content[0].text, /#1/);
+
+  // Stand in for the watcher having delivered and archived the post in core's inbox.
+  const paths = resolvePaths(dir);
+  const pending = drain(paths, "core");
+  assert.equal(pending.length, 1);
+  archive(paths, "core", pending[0].file, pending[0].message);
+  const messageId = pending[0].message.id;
+
+  const core = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "core" });
+  const reply = await call(core, "rooms_reply_all", { messageId, message: "mine, until Friday" }, "/work/tri");
+  assert.equal(reply.isError, undefined);
+  assert.match(reply.content[0].text, /Replied in room tri at #2/);
+
+  const history = readPosts(paths, "tri");
+  assert.deepEqual(history.map((p) => `${p.seq}:${p.from}:${p.text}`), [
+    "1:lead:who owns the migration?",
+    "2:core:mine, until Friday",
+  ]);
+
+  // And the lead was pushed the reply.
+  const leadInbox = drain(paths, "lead");
+  assert.equal(leadInbox.length, 1);
+  assert.equal(leadInbox[0].message.room, "tri");
+  assert.equal(leadInbox[0].message.roomSeq, 2);
 });
 
 test("rooms_list shows membership and post counts", async () => {
