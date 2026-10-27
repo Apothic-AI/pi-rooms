@@ -33,6 +33,7 @@ import {
   listRooms,
   procIdentity,
   readPosts,
+  readRegistration,
   receiptPathFor,
   readRoom,
   readRoster,
@@ -50,6 +51,7 @@ import {
   type Registration,
   type Room,
 } from "./src/store.ts";
+import { claimPin, listPins, pinPath } from "./src/pins.ts";
 
 interface SessionState {
   name: string;
@@ -59,6 +61,13 @@ interface SessionState {
   watcher: fs.FSWatcher | null;
   poller: NodeJS.Timeout | null;
   draining: boolean;
+  /** Pin key the current name came from, when it came from a pin. */
+  pinKey: string | null;
+  /** Attributes captured once, from the environment of this process. */
+  paneId: string | undefined;
+  tabId: string | undefined;
+  workspaceId: string | undefined;
+  sessionId: string | undefined;
 }
 
 function text(body: string, details: Record<string, unknown> = {}) {
@@ -85,8 +94,53 @@ function toList(value: string | string[]): string[] {
 export default function (pi: ExtensionAPI): void {
   let session: SessionState | null = null;
 
+  /**
+   * Resolve this session's name.
+   *
+   * Runs on every tool call rather than once at session start, which is what
+   * lets an operator pin a name for a lane that is already running: the next
+   * call picks the pin up. An explicit `PI_ROOMS_NAME` short-circuits the pin
+   * file entirely, so a pin can never override it.
+   */
+  function refreshName(active: SessionState, cwd: string): void {
+    const explicit = (process.env.PI_ROOMS_NAME ?? process.env.PI_AGENT_NAME ?? "").trim();
+    if (explicit.length > 0) {
+      const slug = slugify(explicit);
+      if (isValidName(slug)) {
+        if (active.name !== slug) {
+          releaseClaimedName(active);
+          active.name = slug;
+          active.pinKey = null;
+        }
+        return;
+      }
+    }
+    const resolved = claimPin(active.paths, {
+      sessionId: active.sessionId,
+      paneId: active.paneId,
+      cwd,
+      pid: process.pid,
+    });
+    if (resolved != null && resolved.name.length > 0 && resolved.name !== active.name) {
+      releaseClaimedName(active);
+      active.name = resolved.name;
+      active.pinKey = resolved.key;
+    }
+  }
+
+  /** Drop the previous name's registration so a rename leaves no ghost behind. */
+  function releaseClaimedName(active: SessionState): void {
+    const existing = readRegistration(active.paths, active.name);
+    // Only remove it when it is ours; another process's registration of the
+    // same name is not this session's to delete.
+    if (existing != null && existing.pid === process.pid) unregister(active.paths, active.name);
+  }
+
   function ensure(ctx: ExtensionContext): SessionState {
-    if (session != null) return session;
+    if (session != null) {
+      refreshName(session, ctx.cwd);
+      return session;
+    }
     const paths = resolvePaths(resolveBase());
     const config = loadConfig(paths);
     const desired = defaultName(ctx.cwd);
@@ -99,8 +153,23 @@ export default function (pi: ExtensionAPI): void {
       watcher: null,
       poller: null,
       draining: false,
+      pinKey: null,
+      paneId: nonEmpty(process.env.HERDR_PANE_ID),
+      tabId: nonEmpty(process.env.HERDR_TAB_ID),
+      workspaceId: nonEmpty(process.env.HERDR_WORKSPACE_ID),
+      sessionId: nonEmpty(process.env.PI_SESSION_ID),
     };
+    refreshName(session, ctx.cwd);
     return session;
+  }
+
+  function pinFileFor(paths: Paths): string {
+    return pinPath(paths);
+  }
+
+  function nonEmpty(value: string | undefined): string | undefined {
+    const trimmed = (value ?? "").trim();
+    return trimmed.length > 0 ? trimmed : undefined;
   }
 
   function join(ctx: ExtensionContext): SessionState {
@@ -111,6 +180,9 @@ export default function (pi: ExtensionAPI): void {
       cwd: ctx.cwd,
       bootId: bootId() ?? undefined,
       procId: procIdentity(process.pid) ?? undefined,
+      paneId: active.paneId,
+      tabId: active.tabId,
+      workspaceId: active.workspaceId,
       sessionId: process.env.PI_SESSION_ID,
       model: process.env.PI_MODEL,
       startedAt: nowIso(),
@@ -265,15 +337,51 @@ export default function (pi: ExtensionAPI): void {
     async execute(_id, _params, _signal, _onUpdate, ctx) {
       const active = ensure(ctx);
       const agents = listAgents(active.paths);
-      const lines = agents.map(
-        (a) =>
-          `${a.name === active.name ? "*" : " "} ${a.name.padEnd(24)} ${a.cwd}${a.model != null ? `  (${a.model})` : ""}`,
-      );
+      const width = Math.min(28, Math.max(12, ...agents.map((a) => a.name.length + 2)));
+      const lines = agents.map((a) => {
+        const pane = a.paneId != null ? a.paneId.padEnd(9) : "-".padEnd(9);
+        const tab = a.tabId != null ? `  ${a.tabId}` : "";
+        return (
+          `${a.name === active.name ? "*" : " "} ${a.name.padEnd(width)} ${pane} ${a.cwd}${tab}` +
+          `${a.model != null ? `  (${a.model})` : ""}`
+        );
+      });
       const body =
         agents.length === 0
           ? "No agents registered."
-          : `${agents.length} agent(s) · you are ${active.name}\n${lines.join("\n")}`;
-      return text(body, { self: active.name, agents });
+          : `${agents.length} agent(s) · you are ${active.name}` +
+            `${active.paneId != null ? ` at ${active.paneId}` : ""}\n` +
+            `${lines.join("\n")}`;
+      return text(body, { self: active.name, pane: active.paneId, agents });
+    },
+  });
+
+  pi.registerTool({
+    name: "rooms_pins",
+    label: "Rooms: name pins",
+    description:
+      "List the name pins in names.json and whether each is claimed, so you can see why an agent has the " +
+      "name it does. Pins are applied on the agent's next tool call, without restarting it.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      const active = ensure(ctx);
+      const pins = listPins(active.paths);
+      if (pins.length === 0) {
+        return text(
+          `No pins in ${pinFileFor(active.paths)}. Add keys such as \"pane:wE:p1B\" or \"cwd:/path\" ` +
+            `as {\"pins\": {\"pane:wE:p1B\": {\"name\": \"dxdb-core\"}}}.`,
+          { pins: [] },
+        );
+      }
+      const lines = pins.map((p) => {
+        const state = !p.valid ? "invalid name" : p.claimed ? "claimed" : "unclaimed";
+        return `  ${p.key.padEnd(38)} ${p.name.padEnd(20)} ${state}`;
+      });
+      return text(
+        `${pins.length} pin(s) · you are ${active.name}\n${lines.join("\n")}\n` +
+          `An explicit PI_ROOMS_NAME beats every pin.`,
+        { pins },
+      );
     },
   });
 

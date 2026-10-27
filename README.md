@@ -57,6 +57,69 @@ Treat the name as a durable lane identity, like a hostname, not as a label. If y
 rename a lane, it leaves its rooms and must be re-added; there is no rename
 alias.
 
+### Pinning a running fleet: `names.json`
+
+`PI_ROOMS_NAME` only takes effect at process start, so pinning a fleet that is
+already running would mean restarting every lane. `<base>/names.json` assigns names
+without that:
+
+```json
+{
+  "pins": {
+    "pane:wE:p1B":    { "name": "dxdb-core" },
+    "session:01a1b2c3": { "name": "sysops-leader" },
+    "cwd:/home/me/Code/dxdb": { "name": "dxdb-lead" }
+  }
+}
+```
+
+Pins are read on **every tool call**, so a pin written now applies to a running
+lane on its next call — no restart, no signal. `rooms_pins` shows every pin and
+whether it is claimed.
+
+Precedence, highest first:
+
+1. `PI_ROOMS_NAME`, then `PI_AGENT_NAME` — a pin **never** overrides an explicit
+   environment name. This is deliberate: the environment is a per-process
+   instruction, and a file cannot speak for a process that already said what it
+   is.
+2. `session:<PI_SESSION_ID>` — survives restarts of that session.
+3. `pane:<HERDR_PANE_ID>` — what you can see in the UI, but herdr **recycles pane
+   ids**, so it is the convenient key and not the durable one.
+4. `cwd:<path>` — easy to write, but cannot tell two lanes in one directory apart.
+
+Session before pane is not arbitrary: a session id survives its pane being moved,
+closed or recreated, and a pane id survives nothing.
+
+**A pin is bound to the process that claimed it.** On first use the entry is
+stamped with that process's start time, and afterwards it only applies to a
+process matching that stamp. So a pin you wrote for `wE:p1B` is *not* silently
+inherited by the next process to occupy `wE:p1B`: the new occupant falls through
+to the next key, `rooms_pins` shows the pin as `claimed`, and you can free it by
+deleting the entry. Without that stamp, recycling a pane id would transfer one
+lane's identity to another, which is the failure this file exists to prevent.
+
+Renaming is a leave-and-join, not an alias: a lane that changes name stops being a
+member of its old identity's rooms. Pin before you create rooms over a lane.
+
+### Correlating a name with a pane
+
+When pi runs under herdr, its process environment carries `HERDR_PANE_ID`,
+`HERDR_TAB_ID` and `HERDR_WORKSPACE_ID`. These are recorded at registration and
+shown by `rooms_who`, so a name can be matched to the pane you are looking at
+without comparing directories:
+
+```
+* dxdb-core    wE:p1B    /home/me/Code/dxdb    wE:t19
+```
+
+The pane id is a **correlation attribute, not an identity**. It is positional and
+recycled, so on its own it says nothing about when; it means "this name is this
+pane, right now" only because it is paired with the process identity recorded
+beside it, and the liveness checks invalidate the pairing when that process goes
+away. Off herdr the fields are simply absent and nothing changes — there is no
+herdr dependency, no socket, no polling.
+
 ### Liveness
 
 The roster reports *running* processes, not *registered* ones. A registration is
@@ -86,6 +149,7 @@ macOS, treat `rooms_who` as advisory and confirm a lane with the multiplexer.
 | `rooms_post` | Post into a room |
 | `rooms_read` | Read room history, `since` a sequence number |
 | `rooms_list` | Rooms, members and post counts |
+| `rooms_pins` | Name pins, and whether each is claimed |
 
 ### Delivery status
 
@@ -165,10 +229,11 @@ not have one should leave it `null` and rely on delivery modes instead.
 ## Storage
 
 ```
-<base>/registry/<name>.json      presence: name, pid, proc identity, cwd, model
+<base>/registry/<name>.json      presence: name, pid, proc identity, pane, cwd, model
 <base>/inbox/<name>/*.json       undelivered messages
 <base>/inbox/<name>/read/*.json  delivered messages, kept for reply_all lookup
 <base>/receipts/<id>.json        per-recipient queued/delivered timestamps
+<base>/names.json                name pins (pane, session, cwd)
 <base>/rooms/<room>/room.json    members, creator
 <base>/rooms/<room>/log.jsonl    append-only history
 ```

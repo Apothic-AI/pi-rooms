@@ -34,6 +34,17 @@ export interface Registration {
   name: string;
   pid: number;
   cwd: string;
+  /**
+   * Correlation attributes, captured from the process environment.
+   *
+   * These are deliberately *not* identity. A herdr pane id is positional and is
+   * recycled, so it says nothing on its own; paired with the proc identity below
+   * it says "this name is this pane, right now", and the moment it stops being
+   * true the liveness checks say so. Undefined off herdr.
+   */
+  paneId?: string;
+  tabId?: string;
+  workspaceId?: string;
   /** Boot id the process was registered under; a mismatch means it cannot be the same process. */
   bootId?: string;
   /**
