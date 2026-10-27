@@ -17,6 +17,7 @@ import {
   archive,
   drain,
   readPosts,
+  register,
   resolvePaths,
 } from "../src/store.ts";
 
@@ -27,6 +28,11 @@ interface Recorded {
 }
 
 function loadExtension(env: Record<string, string>): Recorded {
+  // Sandbox: never inherit a real HERDR_PANE_ID / session id, or every fake lane
+  // in a test would look like the same pane and pins would resolve across tests.
+  for (const key of ["HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "PI_SESSION_ID", "PI_AGENT_NAME"]) {
+    delete process.env[key];
+  }
   for (const [key, value] of Object.entries(env)) process.env[key] = value;
   const recorded: Recorded = { tools: new Map(), handlers: new Map(), sent: [] };
   const pi = {
@@ -222,4 +228,79 @@ test("shutdown removes presence so the roster stays honest", async () => {
   assert.ok(fs.existsSync(path.join(dir, "registry", "temp-lane.json")));
   await ext.handlers.get("session_shutdown")!({}, ctx("/work/temp"));
   assert.equal(fs.existsSync(path.join(dir, "registry", "temp-lane.json")), false);
+});
+
+test("rooms_pins refuses to rename a lane that is a member of a room", async () => {
+  const dir = base();
+  const ext = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "lead" });
+  await call(ext, "rooms_create", { room: "dxdb", members: [] }, "/work/x");
+
+  const refused = await call(ext, "rooms_pins", { action: "set", key: "session:abc", name: "renamed" }, "/work/x");
+  assert.equal(refused.isError, true);
+  assert.match(refused.content[0].text, /Refusing to rename lead -> renamed/);
+  assert.match(refused.content[0].text, /member of dxdb/);
+  assert.match(refused.content[0].text, /force:true/);
+});
+
+test("rooms_pins allows the rename when forced, and reports the rooms left behind", async () => {
+  const dir = base();
+  const ext = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "lead" });
+  await call(ext, "rooms_create", { room: "dxdb", members: [] }, "/work/x");
+
+  const forced = await call(ext, "rooms_pins", { action: "set", key: "session:abc", name: "renamed", force: true }, "/work/x");
+  assert.equal(forced.isError, undefined);
+  assert.match(forced.content[0].text, /Left rooms: dxdb/);
+});
+
+test("rooms_pins set then list shows the pin, and remove deletes it", async () => {
+  const dir = base();
+  const ext = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "solo" });
+  const set = await call(ext, "rooms_pins", { action: "set", key: "session:s-1", name: "solo-lead" }, "/work/solo");
+  assert.equal(set.isError, undefined);
+  assert.match(set.content[0].text, /Pinned session:s-1 -> solo-lead/);
+
+  const listed = await call(ext, "rooms_pins", {}, "/work/solo");
+  assert.match(listed.content[0].text, /session:s-1\s+solo-lead\s+unclaimed/);
+
+  const removed = await call(ext, "rooms_pins", { action: "remove", key: "session:s-1" }, "/work/solo");
+  assert.equal(removed.isError, undefined);
+  assert.match(removed.content[0].text, /Removed pin session:s-1/);
+
+  const after = await call(ext, "rooms_pins", {}, "/work/solo");
+  assert.match(after.content[0].text, /No pins in/);
+});
+
+test("rooms_pins reports a pin that is being ignored rather than looking absent", async () => {
+  const dir = base();
+  // A cwd pin is ambiguous when two lanes share a directory. The second lane has
+  // to be a genuinely different live process: two in-process fakes share a pid,
+  // so neither would count as "another agent" to the other.
+  const { spawn } = await import("node:child_process");
+  const neighbour = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+  try {
+    const paths = resolvePaths(dir);
+    register(paths, {
+      name: "neighbour",
+      pid: neighbour.pid!,
+      cwd: "/work/shared",
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const ext = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "second" });
+    await call(ext, "rooms_pins", { action: "set", key: "cwd:/work/shared", name: "shared-lead" }, "/work/shared");
+    const listed = await call(ext, "rooms_pins", {}, "/work/shared");
+    assert.match(listed.content[0].text, /being ignored/);
+    assert.match(listed.content[0].text, /another agent shares this directory/);
+  } finally {
+    neighbour.kill("SIGKILL");
+  }
+});
+
+test("a bare pin key is treated as a session id", async () => {
+  const dir = base();
+  const ext = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "solo" });
+  await call(ext, "rooms_pins", { action: "set", key: "abc123", name: "by-session" }, "/work/solo");
+  const listed = await call(ext, "rooms_pins", {}, "/work/solo");
+  assert.match(listed.content[0].text, /session:abc123\s+by-session/);
 });

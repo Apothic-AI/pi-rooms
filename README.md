@@ -74,8 +74,8 @@ without that:
 ```
 
 Pins are read on **every tool call**, so a pin written now applies to a running
-lane on its next call — no restart, no signal. `rooms_pins` shows every pin and
-whether it is claimed.
+lane on its next call — no restart, no signal. `rooms_pins` lists every pin and
+whether it is claimed; the table below is what it prints.
 
 Precedence, highest first:
 
@@ -83,10 +83,16 @@ Precedence, highest first:
    environment name. This is deliberate: the environment is a per-process
    instruction, and a file cannot speak for a process that already said what it
    is.
-2. `session:<PI_SESSION_ID>` — survives restarts of that session.
+2. `session:<PI_SESSION_ID>` — **the key to prefer.** It survives restarts of that
+   session, and survives its pane being moved, closed or recreated.
 3. `pane:<HERDR_PANE_ID>` — what you can see in the UI, but herdr **recycles pane
    ids**, so it is the convenient key and not the durable one.
-4. `cwd:<path>` — easy to write, but cannot tell two lanes in one directory apart.
+4. `cwd:<path>` — **only honoured when exactly one pi lane occupies that
+   directory.** A cwd pin carries no way to say *which* lane in a directory it
+   means, so where two lanes share one it is ignored rather than guessed at, and
+   `rooms_pins` says so. The check counts live pi processes in the directory, not
+   just lanes that have joined, because a directory with two panes is ambiguous
+   even before the second one registers.
 
 Session before pane is not arbitrary: a session id survives its pane being moved,
 closed or recreated, and a pane id survives nothing.
@@ -99,8 +105,24 @@ to the next key, `rooms_pins` shows the pin as `claimed`, and you can free it by
 deleting the entry. Without that stamp, recycling a pane id would transfer one
 lane's identity to another, which is the failure this file exists to prevent.
 
-Renaming is a leave-and-join, not an alias: a lane that changes name stops being a
-member of its old identity's rooms. Pin before you create rooms over a lane.
+### Renaming a lane: leave-and-join
+
+**Renaming is not an alias.** A lane's rooms are keyed on its name, so a rename
+takes it out of every room it was in. Nothing announces this: the lane still
+runs, its rooms still exist, and posts simply stop reaching it.
+
+Because that failure is silent, `rooms_pins` **refuses to rename a lane that is
+currently a member of a room**:
+
+```
+Refusing to rename lead -> renamed: it is a member of dxdb. Rooms store members by
+name and there is no rename alias, so renaming leaves those rooms. Pin the lane
+before creating rooms over it, or pass force:true to proceed.
+```
+
+When it does proceed, it names the rooms left behind. So the order that avoids the
+problem entirely is: **pin first, then create rooms over the lane.** A rename is
+only safe before a lane has joined anything.
 
 ### Correlating a name with a pane
 
@@ -149,7 +171,7 @@ macOS, treat `rooms_who` as advisory and confirm a lane with the multiplexer.
 | `rooms_post` | Post into a room |
 | `rooms_read` | Read room history, `since` a sequence number |
 | `rooms_list` | Rooms, members and post counts |
-| `rooms_pins` | Name pins, and whether each is claimed |
+| `rooms_pins` | List, set and remove name pins; refuses a rename that leaves rooms |
 
 ### Delivery status
 

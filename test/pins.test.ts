@@ -23,11 +23,24 @@ import {
   resolvePin,
   writePinFile,
 } from "../src/pins.ts";
-import { procIdentity, resolvePaths } from "../src/store.ts";
+import { procIdentity, register, resolvePaths, type Registration } from "../src/store.ts";
 
 function tempPaths() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rooms-pin-"));
   return resolvePaths(base);
+}
+
+function registerAgent(paths: ReturnType<typeof tempPaths>, name: string, pid: number, cwd: string) {
+  const entry: Registration = {
+    name,
+    pid,
+    cwd,
+    bootId: undefined,
+    procId: procIdentity(pid) ?? undefined,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  register(paths, entry);
 }
 
 function writePins(paths: ReturnType<typeof tempPaths>, pins: Record<string, unknown>) {
@@ -137,4 +150,41 @@ test("listPins reports validity and claimed state without mutating", () => {
   assert.equal(byKey["pane:wE:p1B"].claimed, true);
   assert.equal(byKey["cwd:/work/x"].claimed, false);
   assert.equal(byKey["cwd:/work/y"].valid, false);
+});
+
+test("a cwd pin is ignored when another agent shares the directory", () => {
+  const paths = tempPaths();
+  writePins(paths, { "cwd:/work/x": { name: "dxdb-lead" } });
+
+  // A second live agent in the same cwd, registered under a different name.
+  // A different live process in the same directory. pid 1 is always alive and
+  // is not us, which is the situation the guard is for.
+  registerAgent(paths, "other-lane", 1, "/work/x");
+
+  const resolved = resolvePin(paths, { cwd: "/work/x", pid: process.pid });
+  assert.equal(resolved?.name, "", "ambiguous cwd pin must not be applied");
+  assert.match(resolved!.rejected!.reason, /another agent shares this directory/);
+});
+
+test("a cwd pin applies when the directory holds exactly one lane", () => {
+  const paths = tempPaths();
+  writePins(paths, { "cwd:/work/solo": { name: "solo-lead" } });
+  registerAgent(paths, "lonely", process.pid, "/work/solo");
+  const resolved = claimPin(paths, { cwd: "/work/solo", pid: process.pid });
+  assert.equal(resolved?.name, "solo-lead");
+  assert.equal(resolved?.key, "cwd:/work/solo");
+});
+
+test("a session or pane pin is unaffected by cwd ambiguity", () => {
+  const paths = tempPaths();
+  writePins(paths, {
+    "pane:wE:p1B": { name: "by-pane" },
+    "cwd:/work/x": { name: "ambiguous" },
+  });
+  // A different live process in the same directory. pid 1 is always alive and
+  // is not us, which is the situation the guard is for.
+  registerAgent(paths, "other-lane", 1, "/work/x");
+  const resolved = claimPin(paths, { paneId: "wE:p1B", cwd: "/work/x", pid: process.pid });
+  assert.equal(resolved?.name, "by-pane");
+  assert.equal(resolved?.key, "pane:wE:p1B");
 });

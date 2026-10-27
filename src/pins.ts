@@ -29,7 +29,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { isValidName, procIdentity, slugify, type Paths } from "./store.ts";
+import { isValidName, listAgents, procIdentity, slugify, type Paths } from "./store.ts";
 
 export interface PinEntry {
   name: string;
@@ -58,6 +58,63 @@ export interface ResolvedPin {
   claimed: boolean;
   /** Set when a pin existed for a higher-priority key but was rejected. */
   rejected?: { key: string; reason: string };
+}
+
+/**
+ * How many other live agents share a directory.
+ *
+ * A `cwd:` pin carries no way to say *which* lane in a directory it means, so it
+ * is only safe where the answer is unambiguous. This is the count that decides
+ * that, excluding the asking process.
+ */
+export function otherAgentsInCwd(paths: Paths, cwd: string, pid: number): number {
+  return listAgents(paths).filter((a) => a.cwd === cwd && a.pid !== pid).length;
+}
+
+/**
+ * Whether a `cwd:` pin is unambiguous for this process.
+ *
+ * Counts every live pi process whose cwd is this directory, not only the ones
+ * that have registered with pi-rooms. A directory serving two pi panes is
+ * ambiguous even while the other pane has not joined yet — and a pin read before
+ * the second lane joins would otherwise be honoured, then silently become
+ * ambiguous the moment it did. `process.cwd()` is only ever an approximation
+ * here, so the registered roster is still consulted as well.
+ */
+export function cwdIsAmbiguous(paths: Paths, cwd: string, pid: number): boolean {
+  if (otherAgentsInCwd(paths, cwd, pid) > 0) return true;
+  return unregisteredPanesIn(cwd, pid) > 1;
+}
+
+function unregisteredPanesIn(cwd: string, pid: number): number {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync("/proc");
+  } catch {
+    return 0;
+  }
+  let count = 1; // this process
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const other = Number(entry);
+    if (other === pid) continue;
+    let link: string;
+    try {
+      link = fs.readlinkSync(`/proc/${other}/cwd`);
+    } catch {
+      continue;
+    }
+    if (link !== cwd) continue;
+    // Only counted when it looks like another pi session in the same place.
+    let cmdline: string;
+    try {
+      cmdline = fs.readFileSync(`/proc/${other}/cmdline`, "utf8");
+    } catch {
+      continue;
+    }
+    if (cmdline.includes("pi") && !cmdline.includes("pi-rooms")) count += 1;
+  }
+  return count;
 }
 
 export function pinPath(paths: Paths): string {
@@ -116,6 +173,18 @@ export function resolvePin(paths: Paths, ctx: ResolveContext): ResolvedPin | nul
       rejected = rejected ?? {
         key,
         reason: `"${entry.name}" is not a valid name (lowercase letters, digits, dash, underscore)`,
+      };
+      continue;
+    }
+    // A cwd pin cannot distinguish two lanes in one directory, so honouring it
+    // there would silently decide which lane keeps its name. Refuse instead of
+    // guessing: the operator gets a reason and can pin by session or pane.
+    if (key.startsWith("cwd:") && cwdIsAmbiguous(paths, ctx.cwd, ctx.pid)) {
+      rejected = rejected ?? {
+        key,
+        reason:
+          "cwd pin ignored: another agent shares this directory, so the pin is ambiguous " +
+          "(pin by session: or pane: instead)",
       };
       continue;
     }

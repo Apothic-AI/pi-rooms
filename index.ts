@@ -51,7 +51,7 @@ import {
   type Registration,
   type Room,
 } from "./src/store.ts";
-import { claimPin, listPins, pinPath } from "./src/pins.ts";
+import { claimPin, listPins, pinPath, readPinFile, resolvePin, writePinFile } from "./src/pins.ts";
 
 interface SessionState {
   name: string;
@@ -165,6 +165,23 @@ export default function (pi: ExtensionAPI): void {
 
   function pinFileFor(paths: Paths): string {
     return pinPath(paths);
+  }
+
+  /**
+   * Accept a bare session id, or an explicit `session:`/`pane:`/`cwd:` key.
+   *
+   * The bare form is treated as a session id because that is the key the docs
+   * prefer: it survives pane churn, and a caller who types just an id most
+   * likely means the stable thing rather than the recyclable one.
+   */
+  function normaliseKey(active: SessionState, raw: string): string {
+    const key = raw.trim();
+    if (key.startsWith("session:") || key.startsWith("pane:") || key.startsWith("cwd:")) return key;
+    if (key === "this" || key === "me") {
+      if (active.sessionId != null) return `session:${active.sessionId}`;
+      if (active.paneId != null) return `pane:${active.paneId}`;
+    }
+    return `session:${key}`;
   }
 
   function nonEmpty(value: string | undefined): string | undefined {
@@ -360,27 +377,123 @@ export default function (pi: ExtensionAPI): void {
     name: "rooms_pins",
     label: "Rooms: name pins",
     description:
-      "List the name pins in names.json and whether each is claimed, so you can see why an agent has the " +
-      "name it does. Pins are applied on the agent's next tool call, without restarting it.",
-    parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      "Inspect and edit name pins in names.json. `list` shows every pin and whether it is claimed, so you " +
+      "can tell an ignored pin from an absent one. `set` pins a name, keyed by session id (preferred: it " +
+      "survives pane churn), herdr pane id, or cwd. `remove` deletes a pin.\n\n" +
+      "Renaming a lane is leave-and-join, not an alias: it drops the lane out of every room keyed on its old " +
+      "name. `set` refuses to rename a lane that is a member of a room unless force is true.",
+    parameters: Type.Object({
+      action: Type.Optional(
+        Type.Union([Type.Literal("list"), Type.Literal("set"), Type.Literal("remove")], {
+          description: "Defaults to list",
+        }),
+      ),
+      key: Type.Optional(
+        Type.String({
+          description:
+            "Pin key: `session:<PI_SESSION_ID>`, `pane:<HERDR_PANE_ID>`, or `cwd:<absolute path>`. " +
+            "A bare value with no prefix is treated as a session id.",
+        }),
+      ),
+      name: Type.Optional(Type.String({ description: "Name to pin (set only)" })),
+      force: Type.Optional(Type.Boolean({ description: "Proceed despite a room membership or foreign claim" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       const active = ensure(ctx);
-      const pins = listPins(active.paths);
-      if (pins.length === 0) {
+      const action = params.action ?? "list";
+
+      if (action === "list") {
+        const pins = listPins(active.paths);
+        const rejected = resolvePin(active.paths, {
+          sessionId: active.sessionId,
+          paneId: active.paneId,
+          cwd: ctx.cwd,
+          pid: process.pid,
+        })?.rejected;
+        const header = `you are ${active.name}${active.paneId != null ? ` at ${active.paneId}` : ""}\n`;
+        if (pins.length === 0) {
+          return text(
+            `${header}No pins in ${pinFileFor(active.paths)}.\n` +
+              `Pin with rooms_pins({action:"set", key:"session:${active.sessionId ?? "<session-id>"}", name:"my-lane"}).`,
+            { pins: [] },
+          );
+        }
+        const lines = pins.map((p) => {
+          const state = !p.valid ? "invalid name" : p.claimed ? "claimed" : "unclaimed";
+          const preferred = p.key.startsWith("session:") ? "*" : " ";
+          return `${preferred}${p.key.padEnd(38)} ${p.name.padEnd(20)} ${state}`;
+        });
         return text(
-          `No pins in ${pinFileFor(active.paths)}. Add keys such as \"pane:wE:p1B\" or \"cwd:/path\" ` +
-            `as {\"pins\": {\"pane:wE:p1B\": {\"name\": \"dxdb-core\"}}}.`,
-          { pins: [] },
+          `${header}${pins.length} pin(s) · * = preferred key\n${lines.join("\n")}` +
+            (rejected != null ? `\nA pin is being ignored: ${rejected.key} — ${rejected.reason}` : "") +
+            `\nAn explicit PI_ROOMS_NAME beats every pin.`,
+          { pins, rejected },
         );
       }
-      const lines = pins.map((p) => {
-        const state = !p.valid ? "invalid name" : p.claimed ? "claimed" : "unclaimed";
-        return `  ${p.key.padEnd(38)} ${p.name.padEnd(20)} ${state}`;
-      });
+
+      if (params.key == null) return fail(`${action} needs a key.`);
+      const key = normaliseKey(active, params.key);
+
+      if (action === "remove") {
+        const file = readPinFile(active.paths);
+        if (file.pins[key] == null) return fail(`No pin for ${key}.`);
+        delete file.pins[key];
+        writePinFile(active.paths, file);
+        return text(`Removed pin ${key}.`, { key });
+      }
+
+      if (params.name == null) return fail("set needs a name.");
+      const wanted = slugify(params.name);
+      if (!isValidName(wanted)) {
+        return fail(`"${params.name}" is not a valid name: lowercase letters, digits, dash, underscore.`);
+      }
+
+      // Renaming is leave-and-join, so it is refused when it would silently eject
+      // a lane from a room. This is the loud part: the failure mode is that the
+      // lane simply stops being a member and nothing else complains.
+      const rooms = listRooms(active.paths).filter((r) => r.members.includes(active.name));
+      if (wanted !== active.name && rooms.length > 0 && params.force !== true) {
+        return fail(
+          `Refusing to rename ${active.name} -> ${wanted}: it is a member of ${rooms
+            .map((r) => r.name)
+            .join(", ")}. Rooms store members by name and there is no rename alias, so renaming leaves ` +
+            `those rooms. Pin the lane before creating rooms over it, or pass force:true to proceed.`,
+        );
+      }
+
+      const file = readPinFile(active.paths);
+      const existing = file.pins[key];
+      const current = procIdentity(process.pid);
+      if (
+        existing != null &&
+        existing.procId != null &&
+        current != null &&
+        existing.procId !== current &&
+        params.force !== true
+      ) {
+        return fail(
+          `${key} is already claimed by a different process. Overwriting it would let this lane take that ` +
+            `identity. Use action:"remove" to free it deliberately, or force:true.`,
+        );
+      }
+      file.pins[key] = { name: wanted, note: existing?.note };
+      writePinFile(active.paths, file);
+
+      const appliesHere =
+        (active.sessionId != null && key === `session:${active.sessionId}`) ||
+        (active.paneId != null && key === `pane:${active.paneId}`);
+      if (appliesHere) {
+        refreshName(active, ctx.cwd);
+        join(ctx);
+      }
+
       return text(
-        `${pins.length} pin(s) · you are ${active.name}\n${lines.join("\n")}\n` +
-          `An explicit PI_ROOMS_NAME beats every pin.`,
-        { pins },
+        `Pinned ${key} -> ${wanted}.` +
+          (appliesHere
+            ? ` This session is now ${active.name}.`
+            : ` It applies on that lane's next tool call.`) +
+          (rooms.length > 0 && wanted !== active.name ? ` Left rooms: ${rooms.map((r) => r.name).join(", ")}.` : ""),
+        { key, name: wanted, appliedHere: appliesHere, leftRooms: rooms.map((r) => r.name) },
       );
     },
   });
