@@ -29,12 +29,50 @@ Each session registers one name. Precedence:
 
 1. `PI_ROOMS_NAME`
 2. `PI_AGENT_NAME` (so existing pi tooling and this extension agree)
-3. a stable name derived from the working directory, e.g. `m2-core-1a2f`
+3. a name derived from the working directory plus a short hash, e.g. `m2-core-1a2f`
 
-The directory-derived fallback is stable across restarts and distinct per
-worktree, which matters when several lanes run from sibling checkout directories.
-A name already held by another live process is never taken over; the newcomer
-gets a suffixed variant instead, so two agents cannot merge into one inbox.
+### Pin `PI_ROOMS_NAME` if you use rooms
+
+**This is the supported way to get stable identity, and rooms are not durable
+without it.** The directory-derived fallback is stable across restarts only while
+the name is unchallenged. If two sessions in the same directory claim it at once,
+the second gets a pid suffix (`overlord-18c7-46525`), and after a restart neither
+name comes back: the hash is the same but the pid is new, so the lane returns as
+`overlord-18c7-72208`.
+
+The consequence is silent: **a room's membership empties across a restart.** Room
+members are stored by name, so every member that comes back under a different name
+is simply no longer that room's member — `rooms_post` pushes to nobody, and
+`rooms_who` shows a lane the room has never heard of. Nothing errors, because from
+the extension's point of view the old member is gone and a new agent has arrived.
+
+Pin the name per pane and none of that happens:
+
+```sh
+# in each lane's environment
+PI_ROOMS_NAME=dxdb-core
+```
+
+Treat the name as a durable lane identity, like a hostname, not as a label. If you
+rename a lane, it leaves its rooms and must be re-added; there is no rename
+alias.
+
+### Liveness
+
+The roster reports *running* processes, not *registered* ones. A registration is
+considered gone when its pid is missing, when it was written during an earlier
+boot, when the pid's start time does not match the one recorded, or when the
+process is a zombie. Reused pids and post-reboot ghosts are therefore reaped rather
+than listed.
+
+**Platform caveat, stated plainly.** The start-time and zombie checks read
+`/proc/<pid>/stat` and are **Linux only**. Elsewhere — macOS included — there is no
+`/proc`, so the extension degrades to `process.kill(pid, 0)` and the boot-id file
+is absent too. On those platforms a reused pid is *not* detectable, and a zombie
+answers `kill(pid, 0)` successfully, so presence can outlive the process. The
+fallback is deliberate: reporting everything dead on a platform without `/proc`
+would be worse than reporting a stale entry. If you run a long-lived fleet on
+macOS, treat `rooms_who` as advisory and confirm a lane with the multiplexer.
 
 ## Tools
 
@@ -48,6 +86,22 @@ gets a suffixed variant instead, so two agents cannot merge into one inbox.
 | `rooms_post` | Post into a room |
 | `rooms_read` | Read room history, `since` a sequence number |
 | `rooms_list` | Rooms, members and post counts |
+
+### Delivery status
+
+Every message gets a receipt file at `<base>/receipts/<message-id>.json`, recording
+what the extension could actually observe:
+
+- **`queuedAt`** — the recipient's inbox accepted the message. `rooms_dm` reports
+  this the moment it returns.
+- **`deliveredAt`** — the recipient's own session was handed the message through
+  `pi.sendMessage`. This is the last moment the extension can see anything.
+
+There is deliberately **no read or acknowledged state**. The extension cannot see
+what a model does with a message once its session holds it, and a receipt that
+claimed more than it observed would be worse than no receipt at all. "Queued but
+not delivered" is a real and useful signal: it means the recipient's session is
+not running, or its inbox watcher never fired.
 
 ### Rooms
 
@@ -111,9 +165,10 @@ not have one should leave it `null` and rely on delivery modes instead.
 ## Storage
 
 ```
-<base>/registry/<name>.json      presence: name, pid, cwd, model
+<base>/registry/<name>.json      presence: name, pid, proc identity, cwd, model
 <base>/inbox/<name>/*.json       undelivered messages
 <base>/inbox/<name>/read/*.json  delivered messages, kept for reply_all lookup
+<base>/receipts/<id>.json        per-recipient queued/delivered timestamps
 <base>/rooms/<room>/room.json    members, creator
 <base>/rooms/<room>/log.jsonl    append-only history
 ```
@@ -126,13 +181,17 @@ on a room log is a complete view of that room.
 
 - One `PI_ROOMS_DIR` shared by every lane is one namespace. A room is the unit of
   grouping; you do not need to partition directories to keep conversations apart.
-- Give each lane an explicit `PI_ROOMS_NAME` when names matter. Generated
-  directory names are stable but not meaningful.
+- **Pin `PI_ROOMS_NAME` on every lane.** See [Identity](#identity). Without it a
+  room's membership silently empties across a restart, which is the kind of thing
+  a user discovers at the worst possible moment — mid-recovery, when a reliable
+  roster matters most.
 - `roomDelivery: "followUp"` is the safer default for a fleet: room chatter waits
   for an idle boundary instead of interrupting work.
 - Messages are delivered into the receiver's context. Anyone in a room can
   therefore put text in front of every other member — treat room membership as a
   trust boundary, the same as giving someone a prompt.
+- Treat `rooms_who` as the live roster on Linux, and as advisory on macOS where
+  the `/proc` checks are unavailable.
 
 ## Development
 

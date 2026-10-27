@@ -20,6 +20,7 @@ import { loadConfig, type RoomsConfig } from "./src/config.ts";
 import {
   archive,
   appendPost,
+  bootId,
   claimName,
   createRoom,
   defaultName,
@@ -30,8 +31,11 @@ import {
   isValidRoom,
   listAgents,
   listRooms,
+  procIdentity,
   readPosts,
+  receiptPathFor,
   readRoom,
+  readRoster,
   register,
   resolveBase,
   resolvePaths,
@@ -105,6 +109,8 @@ export default function (pi: ExtensionAPI): void {
       name: active.name,
       pid: process.pid,
       cwd: ctx.cwd,
+      bootId: bootId() ?? undefined,
+      procId: procIdentity(process.pid) ?? undefined,
       sessionId: process.env.PI_SESSION_ID,
       model: process.env.PI_MODEL,
       startedAt: nowIso(),
@@ -176,6 +182,9 @@ export default function (pi: ExtensionAPI): void {
             deliverAs: isRoom ? active.config.roomDelivery : active.config.dmDelivery,
           },
         );
+        // archive stamps deliveredAt and writes the receipt; it runs after the
+        // handoff so a crash between the two reports "queued" rather than a
+        // delivery that never happened.
         archive(active.paths, active.name, entry.file, entry.message);
       }
     } catch {
@@ -297,7 +306,9 @@ export default function (pi: ExtensionAPI): void {
       const written = deliver(active.paths, message);
       const missing = recipients.filter((r) => !written.includes(r));
       return text(
-        `Sent to ${written.length} agent(s)${missing.length > 0 ? `; skipped ${missing.join(", ")}` : ""}. id ${message.id}`,
+        `Queued to ${written.length} agent(s)${missing.length > 0 ? `; skipped ${missing.join(", ")}` : ""}. id ${message.id}\n` +
+          `Queued is not delivered: each recipient's session records a deliveredAt when it is handed the message. ` +
+          `The receipt file is ${receiptPathFor(active.paths, message.id)}.`,
         { id: message.id, delivered: written, skipped: missing },
       );
     },

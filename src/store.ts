@@ -11,6 +11,12 @@
  *   inbox/<name>/read/*.json      delivered messages, kept for reply_all lookup
  *   rooms/<room>/room.json        room metadata: members, creator
  *   rooms/<room>/log.jsonl        append-only room history, one post per line
+ *
+ * Liveness is a pid *plus* the identity of the process behind it. A bare pid is
+ * not enough: after a reboot the same number is handed to an unrelated process,
+ * and a stale registration then reads as alive forever. Every registration
+ * therefore records the boot id and, where the platform exposes one, the
+ * process start time, and both are compared on read.
  */
 
 import * as fs from "node:fs";
@@ -28,6 +34,17 @@ export interface Registration {
   name: string;
   pid: number;
   cwd: string;
+  /** Boot id the process was registered under; a mismatch means it cannot be the same process. */
+  bootId?: string;
+  /**
+   * Opaque platform process identity captured at registration.
+   *
+   * On Linux this is `<starttime>:<state>` from /proc/<pid>/stat. Comparing it
+   * on read is what makes pid reuse detectable: the number can be reused, the
+   * (starttime, state) pair cannot be forged by an unrelated process that
+   * started later.
+   */
+  procId?: string;
   model?: string;
   sessionId?: string;
   startedAt: string;
@@ -40,12 +57,32 @@ export interface Delivery {
   to: string[];
   text: string;
   sentAt: string;
+  /** When the message was written into an inbox. Set by `deliver`. */
+  queuedAt?: string;
+  /** When the recipient's session was handed the message. Set by `archive`. */
+  deliveredAt?: string;
+  /** Recipients whose inbox accepted the message, with the per-recipient queue time. */
+  receipts?: Record<string, Receipt>;
   /** Set when the message was posted into a room. */
   room?: string;
   /** Position in the room log at the time of posting, 1-based. */
   roomSeq?: number;
   /** Message id this one answers, when produced by reply_all. */
   replyTo?: string;
+}
+
+/**
+ * What the extension can honestly observe about one message.
+ *
+ * `queued` means a file exists in the recipient's inbox; `delivered` means the
+ * recipient's own session was handed it through `pi.sendMessage`. There is
+ * deliberately no `read` state: the extension cannot see what a model does with
+ * a message once its session has it, and a receipt that claimed otherwise would
+ * be worse than none.
+ */
+export interface Receipt {
+  queuedAt: string;
+  deliveredAt?: string;
 }
 
 export interface Room {
@@ -56,6 +93,8 @@ export interface Room {
 }
 
 export interface RoomPost {
+  /** Message id, so the post can be joined to its delivery receipts. */
+  id?: string;
   from: string;
   text: string;
   sentAt: string;
@@ -68,6 +107,7 @@ export interface Paths {
   registry: string;
   inbox: string;
   rooms: string;
+  receipts: string;
 }
 
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
@@ -87,6 +127,7 @@ export function resolvePaths(base: string): Paths {
     registry: path.join(base, "registry"),
     inbox: path.join(base, "inbox"),
     rooms: path.join(base, "rooms"),
+    receipts: path.join(base, "receipts"),
   };
 }
 
@@ -141,6 +182,101 @@ export function isAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Identity of the current boot, or null where the platform has none.
+ *
+ * A registration made in an earlier boot can never refer to a live process,
+ * however plausible its pid looks afterwards.
+ */
+export function bootId(): string | null {
+  try {
+    return fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Opaque process identity for a pid, or null when the platform cannot supply one.
+ *
+ * Linux only: reads `<starttime>:<state>` out of /proc/<pid>/stat. The command
+ * name field is parenthesised and may itself contain spaces and parentheses, so
+ * the fields are located after the final ')' rather than split on whitespace.
+ *
+ * The state is kept so a zombie can be reported as dead: `process.kill(pid, 0)`
+ * succeeds for a zombie, and a zombie will never read its inbox.
+ */
+export function procIdentity(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch {
+    return null;
+  }
+  const close = raw.lastIndexOf(")");
+  if (close === -1) return null;
+  // After "comm)" come: state ppid pgrp session tty_nr tpgid flags minflt ...
+  // starttime is field 22 overall, and field 3 is state, so within this tail
+  // state is index 0 and starttime index 19.
+  const tail = raw.slice(close + 1).trim().split(/\s+/);
+  const state = tail[0];
+  const starttime = tail[19];
+  if (state == null || starttime == null) return null;
+  return `${starttime}:${state}`;
+}
+
+/** True when a recorded proc identity is one no live process can present. */
+function isDeadState(procId: string | null | undefined): boolean {
+  if (procId == null) return false;
+  const state = procId.split(":")[1];
+  // Z zombie, X/x dead, T/t stopped are all unable to make progress; Z is the
+  // one that matters, because it still answers kill(pid, 0) successfully.
+  return state === "Z" || state === "X" || state === "x";
+}
+
+/**
+ * Whether a registration still refers to the process that wrote it.
+ *
+ * Three independent checks, cheapest first:
+ *
+ * 1. pid exists at all;
+ * 2. it belongs to this boot, when the platform reports a boot id;
+ * 3. its start time matches the one recorded, so a reused pid is caught;
+ * 4. it is not a zombie, which would otherwise pass check 1 forever.
+ *
+ * Where the platform supplies no proc identity (non-Linux), this degrades to
+ * the pid check alone — the same behaviour as before, stated rather than
+ * assumed.
+ */
+export function isRegistrationLive(reg: Registration): boolean {
+  if (!isAlive(reg.pid)) return false;
+  const current = bootId();
+  if (reg.bootId != null && current != null && reg.bootId !== current) return false;
+  const identity = procIdentity(reg.pid);
+  if (identity != null && reg.procId != null) {
+    // A dead state is checked first: a zombie keeps its starttime, so the
+    // mismatch test would otherwise report it as a reused pid and mislabel the
+    // one failure a human could actually clear by reaping.
+    if (isDeadState(identity)) return false;
+    if (identity !== reg.procId) return false;
+  }
+  return true;
+}
+
+/** Why a registration is considered gone, for diagnostics. */
+export function livenessDiagnosis(reg: Registration): string | null {
+  if (!isAlive(reg.pid)) return "no such process";
+  const current = bootId();
+  if (reg.bootId != null && current != null && reg.bootId !== current) return "registered in an earlier boot";
+  const identity = procIdentity(reg.pid);
+  if (identity != null && reg.procId != null) {
+    if (isDeadState(identity)) return "process is a zombie";
+    if (identity !== reg.procId) return "pid was reused by another process";
+  }
+  return null;
+}
+
 function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -175,17 +311,30 @@ export function readRegistration(paths: Paths, name: string): Registration | nul
  * Dead entries are removed as a side effect, so presence never accumulates
  * ghosts when an agent is killed rather than shut down cleanly.
  */
-export function listAgents(paths: Paths): Registration[] {
+export interface RosterEntry extends Registration {
+  /** Null when the agent is live; a reason when it is not. */
+  gone: string | null;
+}
+
+/**
+ * Every registration, live or not, with the reason it is gone.
+ *
+ * Callers that must not lie about who is reachable use this; callers that want
+ * a clean roster use {@link listAgents}. Reporting a stale name as present is
+ * worse than reporting nothing, because during a restart it is exactly what
+ * gets acted on.
+ */
+export function readRoster(paths: Paths): RosterEntry[] {
   let files: string[];
   try {
     files = fs.readdirSync(paths.registry).filter((f) => f.endsWith(".json"));
   } catch {
     return [];
   }
-  const agents: Registration[] = [];
+  const roster: RosterEntry[] = [];
   for (const file of files) {
     const reg = readJson<Registration>(path.join(paths.registry, file));
-    if (reg == null || !isAlive(reg.pid)) {
+    if (reg == null) {
       try {
         fs.unlinkSync(path.join(paths.registry, file));
       } catch {
@@ -193,9 +342,34 @@ export function listAgents(paths: Paths): Registration[] {
       }
       continue;
     }
-    agents.push(reg);
+    roster.push({ ...reg, gone: livenessDiagnosis(reg) });
   }
-  return agents.sort((a, b) => a.name.localeCompare(b.name));
+  return roster.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Every registration whose process is still running.
+ *
+ * Dead entries are removed as a side effect, so presence never accumulates
+ * ghosts when an agent is killed rather than shut down cleanly. A reused pid
+ * or an entry from an earlier boot is dead here even though the number is
+ * still in use.
+ */
+export function listAgents(paths: Paths): Registration[] {
+  const live: Registration[] = [];
+  for (const entry of readRoster(paths)) {
+    if (entry.gone != null) {
+      try {
+        fs.unlinkSync(path.join(paths.registry, `${entry.name}.json`));
+      } catch {
+        /* another process pruned it first */
+      }
+      continue;
+    }
+    const { gone: _gone, ...registration } = entry;
+    live.push(registration);
+  }
+  return live;
 }
 
 /**
@@ -210,7 +384,7 @@ export function claimName(paths: Paths, desired: string, pid: number): string {
   let candidate = base;
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const existing = readRegistration(paths, candidate);
-    if (existing == null || !isAlive(existing.pid) || existing.pid === pid) return candidate;
+    if (existing == null || !isRegistrationLive(existing) || existing.pid === pid) return candidate;
     candidate = `${base.slice(0, 44)}-${pid}`;
     if (attempt > 0) candidate = `${base.slice(0, 40)}-${pid}-${attempt}`;
   }
@@ -243,18 +417,71 @@ export interface PendingMessage {
 }
 
 /** Write one delivery into every recipient's inbox. The sender's own box is skipped. */
+/**
+ * Write one delivery into every recipient's inbox. The sender's own box is skipped.
+ *
+ * Each copy records its own `queuedAt`, and the shared receipt file is updated
+ * so the sender can later ask what the extension observed.
+ */
 export function deliver(paths: Paths, message: Delivery): string[] {
   const written: string[] = [];
   const stamp = Date.now();
+  const queuedAt = new Date(stamp).toISOString();
   for (const [index, recipient] of message.to.entries()) {
     if (!isValidName(recipient) || recipient === message.from) continue;
     const dir = inboxDir(paths, recipient);
     ensureDir(dir);
     const file = path.join(dir, `${stamp}-${index}-${message.id.slice(0, 8)}.json`);
-    writeJsonAtomic(file, message);
+    writeJsonAtomic(file, { ...message, queuedAt });
     written.push(recipient);
+    recordReceipt(paths, message.id, recipient, { queuedAt });
   }
   return written;
+}
+
+function receiptPath(paths: Paths, id: string): string {
+  return path.join(paths.receipts, `${id}.json`);
+}
+
+/** Where a message's receipt file lives, for callers that report it to a human. */
+export function receiptPathFor(paths: Paths, id: string): string {
+  return receiptPath(paths, id);
+}
+
+function recordReceipt(paths: Paths, id: string, recipient: string, patch: Partial<Receipt>): void {
+  const file = receiptPath(paths, id);
+  const existing = readJson<{ id: string; receipts: Record<string, Receipt> }>(file) ?? {
+    id,
+    receipts: {},
+  };
+  const current = existing.receipts[recipient] ?? ({} as Receipt);
+  // Never move a timestamp backwards: a repeated call is not new information.
+  existing.receipts[recipient] = {
+    queuedAt: current.queuedAt ?? patch.queuedAt ?? new Date().toISOString(),
+    deliveredAt: current.deliveredAt ?? patch.deliveredAt,
+  };
+  writeJsonAtomic(file, existing);
+}
+
+/** What the extension observed for one message, or null when it never saw it. */
+export interface ReceiptRecord {
+  id: string;
+  receipts: Record<string, Receipt>;
+}
+
+export function readReceipts(paths: Paths, id: string): ReceiptRecord | null {
+  if (!/^[0-9a-f-]{8,}$/i.test(id)) return null;
+  return readJson<ReceiptRecord>(receiptPath(paths, id));
+}
+
+/**
+ * Record that a recipient's session was handed a message.
+ *
+ * Called by the delivery loop immediately before `pi.sendMessage`, which is the
+ * last moment the extension can observe anything.
+ */
+export function markDelivered(paths: Paths, id: string, recipient: string): void {
+  recordReceipt(paths, id, recipient, { deliveredAt: new Date().toISOString() });
 }
 
 /** Undelivered messages for one agent, oldest first. */
@@ -293,12 +520,19 @@ export function archive(paths: Paths, name: string, file: string, message: Deliv
   const readDir = path.join(inboxDir(paths, name), "read");
   ensureDir(readDir);
   const target = path.join(readDir, path.basename(file));
+  const deliveredAt = new Date().toISOString();
+  const stamped: Delivery = {
+    ...message,
+    queuedAt: message.queuedAt ?? deliveredAt,
+    deliveredAt: message.deliveredAt ?? deliveredAt,
+  };
   try {
     fs.renameSync(file, target);
   } catch {
     return;
   }
-  writeJsonAtomic(path.join(readDir, `${message.id}.json`), message);
+  writeJsonAtomic(path.join(readDir, `${message.id}.json`), stamped);
+  markDelivered(paths, message.id, name);
   pruneReadHistory(paths, name);
 }
 
