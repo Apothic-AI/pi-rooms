@@ -1,0 +1,44 @@
+{
+  "name": "pi-rooms",
+  "version": "0.1.0",
+  "description": "Rooms, DMs and reply-all for pi coding agent sessions. File-based, no daemon.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Apothic AI",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "rooms",
+    "messaging",
+    "multi-agent"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc -p ."
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typebox": "^1.4.3",
+    "typescript": "^7.0.2"
+  }
+}
