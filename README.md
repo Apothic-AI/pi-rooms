@@ -17,8 +17,8 @@ PRD-to-parallel-workers orchestrator, this is the wrong package.
 ## Install
 
 ```sh
-pi install /path/to/pi-rooms          # local checkout
-pi install git:github.com/you/pi-rooms  # once pushed
+pi install npm:@apothic-ai/pi-rooms
+pi install git:github.com/Apothic-AI/pi-rooms   # from source
 ```
 
 State lives in `~/.pi/agent/rooms` unless `PI_ROOMS_DIR` says otherwise.

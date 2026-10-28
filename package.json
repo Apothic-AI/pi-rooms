@@ -1,10 +1,21 @@
 {
-  "name": "pi-rooms",
+  "name": "@apothic-ai/pi-rooms",
   "version": "0.1.0",
   "description": "Rooms, DMs and reply-all for pi coding agent sessions. File-based, no daemon.",
   "type": "module",
   "license": "MIT",
   "author": "Apothic AI",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Apothic-AI/pi-rooms.git"
+  },
+  "homepage": "https://github.com/Apothic-AI/pi-rooms#readme",
+  "bugs": {
+    "url": "https://github.com/Apothic-AI/pi-rooms/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "pi-package",
     "pi",
