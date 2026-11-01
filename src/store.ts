@@ -237,6 +237,23 @@ export function procIdentity(pid: number): string | null {
   return `${starttime}:${state}`;
 }
 
+/**
+ * Whether two proc identities name the same process *start*.
+ *
+ * Identity is the start time alone. The state letter rides inside the identity
+ * string so a zombie can be reported, but it also changes whenever a process
+ * sleeps or runs — and a pi lane does that on every turn. Comparing the whole
+ * string therefore treats a healthy lane as a reused pid and prunes its
+ * registration, or rejects its pin, the moment it goes idle.
+ */
+export function sameProcessStart(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean {
+  if (a == null || b == null) return false;
+  return a.split(":")[0] === b.split(":")[0];
+}
+
 /** True when a recorded proc identity is one no live process can present. */
 function isDeadState(procId: string | null | undefined): boolean {
   if (procId == null) return false;
@@ -270,7 +287,7 @@ export function isRegistrationLive(reg: Registration): boolean {
     // mismatch test would otherwise report it as a reused pid and mislabel the
     // one failure a human could actually clear by reaping.
     if (isDeadState(identity)) return false;
-    if (identity !== reg.procId) return false;
+    if (!sameProcessStart(identity, reg.procId)) return false;
   }
   return true;
 }
@@ -283,7 +300,7 @@ export function livenessDiagnosis(reg: Registration): string | null {
   const identity = procIdentity(reg.pid);
   if (identity != null && reg.procId != null) {
     if (isDeadState(identity)) return "process is a zombie";
-    if (identity !== reg.procId) return "pid was reused by another process";
+    if (!sameProcessStart(identity, reg.procId)) return "pid was reused by another process";
   }
   return null;
 }

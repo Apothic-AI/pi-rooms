@@ -154,6 +154,21 @@ test("proc identity is stable across two reads of the same process", () => {
   assert.match(a!, /^\d+:[A-Za-z]$/);
 });
 
+test("a state change does not make a live registration dead", () => {
+  // The process alternates S (sleeping) and R (running) on every turn; a lane
+  // that works and then idles flips between them constantly. The state letter
+  // is not part of process identity — only the start time proves the pid was
+  // not reused. A registration written while running must therefore stay live
+  // once the process sleeps, which is the ordinary lifecycle of every lane.
+  const identity = procIdentity(process.pid);
+  assert.ok(identity != null);
+  const [starttime, state] = identity!.split(":");
+  const otherState = state === "S" ? "R" : "S";
+  const flipped = reg({ procId: `${starttime}:${otherState}` });
+  assert.equal(isRegistrationLive(flipped), true);
+  assert.equal(livenessDiagnosis(flipped), null);
+});
+
 test("proc identity is null for a pid that does not exist", () => {
   assert.equal(procIdentity(999999), null);
 });

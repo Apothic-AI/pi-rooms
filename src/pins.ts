@@ -29,7 +29,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { isValidName, listAgents, procIdentity, slugify, type Paths } from "./store.ts";
+import { isValidName, listAgents, procIdentity, sameProcessStart, slugify, type Paths } from "./store.ts";
 
 export interface PinEntry {
   name: string;
@@ -190,7 +190,7 @@ export function resolvePin(paths: Paths, ctx: ResolveContext): ResolvedPin | nul
     }
     // A pin claimed by a different process has been inherited by this one: the
     // pane or session key now belongs to someone else.
-    if (entry.procId != null && current != null && entry.procId !== current) {
+    if (entry.procId != null && current != null && !sameProcessStart(entry.procId, current)) {
       rejected = rejected ?? { key, reason: "pin was claimed by a different process" };
       continue;
     }
