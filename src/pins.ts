@@ -36,7 +36,16 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { isReservedName, isValidName, listAgents, procIdentity, sameProcessStart, slugify, type Paths } from "./store.ts";
+import {
+  isReservedName,
+  isValidName,
+  listAgents,
+  procIdentity,
+  sameProcessStart,
+  slugify,
+  withFileLock,
+  type Paths,
+} from "./store.ts";
 
 export interface PinEntry {
   name: string;
@@ -155,6 +164,31 @@ export function writePinFile(paths: Paths, file: PinFile): void {
   fs.renameSync(tmp, pinPath(paths));
 }
 
+/**
+ * Read-modify-write of the pin file, holding a lock across both halves.
+ *
+ * `names.json` is shared by every lane in the fleet, and two lanes claiming or
+ * releasing pins at the same moment each read the old file and write their own
+ * version — one claim silently disappears. The lock spans the read for that
+ * reason; locking only {@link writePinFile} would still lose the loser's update.
+ *
+ * The edit reports whether it changed anything, so a read-only call does not
+ * rewrite the file and hands back what it computed. `writePinFile` stays the raw,
+ * unlocked writer for setup code and tests; calling it from inside `editPins`
+ * would try to take a lock this process already holds.
+ */
+export function editPins<T>(
+  paths: Paths,
+  edit: (file: PinFile) => { changed: boolean; value: T },
+): T {
+  return withFileLock(pinPath(paths), () => {
+    const file = readPinFile(paths);
+    const { changed, value } = edit(file);
+    if (changed) writePinFile(paths, file);
+    return value;
+  });
+}
+
 /** The keys that could apply to this process, highest priority first. */
 export function candidateKeys(ctx: ResolveContext): string[] {
   const keys: string[] = [];
@@ -229,28 +263,27 @@ export function claimPin(paths: Paths, ctx: ResolveContext): ResolvedPin | null 
   if (resolved == null || resolved.name.length === 0) return resolved;
   if (!resolved.claimed) return resolved;
 
-  const file = readPinFile(paths);
-  const entry = file.pins[resolved.key];
-  if (entry == null) return { ...resolved, claimed: false };
-  const current = procIdentity(ctx.pid);
-  const slug = slugify(resolved.name);
-  file.pins[resolved.key] = { ...entry, name: slug, procId: current ?? undefined };
-  writePinFile(paths, file);
-  // `claimed` stays true: this call is the one that bound the pin to this
-  // process, and a caller that needs to know whether a claim happened (to log
-  // it, or to warn about a pin it just consumed) cannot infer it afterwards.
-  return { ...resolved, name: slug, claimed: true };
+  return editPins<ResolvedPin>(paths, (file): { changed: boolean; value: ResolvedPin } => {
+    const entry = file.pins[resolved.key];
+    if (entry == null) return { changed: false, value: { ...resolved, claimed: false } };
+    const current = procIdentity(ctx.pid);
+    const slug = slugify(resolved.name);
+    file.pins[resolved.key] = { ...entry, name: slug, procId: current ?? undefined };
+    // `claimed` stays true: this call is the one that bound the pin to this
+    // process, and a caller that needs to know whether a claim happened (to log
+    // it, or to warn about a pin it just consumed) cannot infer it afterwards.
+    return { changed: true, value: { ...resolved, name: slug, claimed: true } };
+  });
 }
 
 /** Release a pin claimed by a dead process, so the next occupant can use it. */
 export function releaseStalePin(paths: Paths, key: string): boolean {
-  const file = readPinFile(paths);
-  const entry = file.pins[key];
-  if (entry == null) return false;
-  if (entry.procId == null) return false;
-  delete file.pins[key];
-  writePinFile(paths, file);
-  return true;
+  return editPins(paths, (file) => {
+    const entry = file.pins[key];
+    if (entry == null || entry.procId == null) return { changed: false, value: false };
+    delete file.pins[key];
+    return { changed: true, value: true };
+  });
 }
 
 /** Every pin, with the name it resolves to. For diagnostics. */

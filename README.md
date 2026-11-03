@@ -183,11 +183,23 @@ what the extension could actually observe:
 - **`deliveredAt`** — the recipient's own session was handed the message through
   `pi.sendMessage`. This is the last moment the extension can see anything.
 
-There is deliberately **no read or acknowledged state**. The extension cannot see
-what a model does with a message once its session holds it, and a receipt that
-claimed more than it observed would be worse than no receipt at all. "Queued but
-not delivered" is a real and useful signal: it means the recipient's session is
-not running, or its inbox watcher never fired.
+There is deliberately **no read or acknowledged state written by the extension**. It
+cannot see what a model does with a message once its session holds it, and a
+receipt that claimed more than it observed would be worse than no receipt at all.
+"Queued but not delivered" is a real and useful signal: it means the recipient's
+session is not running, or its inbox watcher never fired.
+
+- **`readAt`** — written by a *client*, not by the extension, when it renders the
+  message to a human. A client is the renderer, so it can attest when the bytes
+  became visible on a screen; that is a different holder class making a claim
+  about a different fact. It means "a screen showed this", never "acted on" or
+  "agreed with". The first read wins: reading the same message twice is not new
+  information.
+
+Receipts are merged, never rewritten from scratch, so a field one writer does not
+know about survives another writer's update — and every update holds a lock
+across its read-modify-write, so two writers cannot lose each other's timestamp.
+An absent `deliveredAt` means **unknown**, never "never delivered".
 
 ### Rooms
 

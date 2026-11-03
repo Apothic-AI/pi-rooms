@@ -18,6 +18,7 @@ import { Type } from "typebox";
 
 import { loadConfig, type RoomsConfig } from "./src/config.ts";
 import {
+  addRoomMember,
   archive,
   appendPost,
   bootId,
@@ -45,7 +46,6 @@ import {
   resolvePaths,
   roomSeq,
   sanitize,
-  saveRoom,
   slugify,
   unregister,
   uniqueMembers,
@@ -55,7 +55,14 @@ import {
   type Registration,
   type Room,
 } from "./src/store.ts";
-import { claimPin, listPins, pinPath, readPinFile, resolvePin, writePinFile } from "./src/pins.ts";
+import {
+  claimPin,
+  editPins,
+  listPins,
+  pinPath,
+  readPinFile,
+  resolvePin,
+} from "./src/pins.ts";
 
 interface SessionState {
   name: string;
@@ -525,10 +532,12 @@ export default function (pi: ExtensionAPI): void {
       const key = normaliseKey(active, params.key);
 
       if (action === "remove") {
-        const file = readPinFile(active.paths);
-        if (file.pins[key] == null) return fail(`No pin for ${key}.`);
-        delete file.pins[key];
-        writePinFile(active.paths, file);
+        const removed = editPins(active.paths, (file) => {
+          if (file.pins[key] == null) return { changed: false, value: false };
+          delete file.pins[key];
+          return { changed: true, value: true };
+        });
+        if (!removed) return fail(`No pin for ${key}.`);
         return text(`Removed pin ${key}.`, { key });
       }
 
@@ -566,8 +575,14 @@ export default function (pi: ExtensionAPI): void {
             `identity. Use action:"remove" to free it deliberately, or force:true.`,
         );
       }
-      file.pins[key] = { name: wanted, note: existing?.note };
-      writePinFile(active.paths, file);
+      // The claim check above is advisory and racy on purpose — it decides whether
+      // to *tell* the operator off, and `force` can override it. The write below is
+      // the locked read-modify-write, so a concurrent pin for a different key
+      // cannot be lost. The `existing` note is re-read inside the lock.
+      editPins(active.paths, (inner) => {
+        inner.pins[key] = { name: wanted, note: inner.pins[key]?.note };
+        return { changed: true, value: undefined };
+      });
 
       const appliesHere =
         (active.sessionId != null && key === `session:${active.sessionId}`) ||
@@ -655,14 +670,19 @@ export default function (pi: ExtensionAPI): void {
       if (original.room != null) {
         const room = readRoom(active.paths, original.room);
         if (room == null) return fail(`Room ${original.room} no longer exists.`);
+        // One id for both the log line and the envelope, so a post in the history
+        // can be joined to the receipts it produced. Minting a second uuid for
+        // the envelope left receipts naming an id the history did not contain.
+        const id = randomUUID();
         const seq = appendPost(active.paths, room.name, {
+          id,
           from: active.name,
           text: body,
           sentAt: nowIso(),
           recipients: room.members.filter((m) => m !== active.name),
         });
         deliver(active.paths, {
-          id: randomUUID(),
+          id,
           from: active.name,
           to: room.members.filter((m) => m !== active.name),
           text: body,
@@ -741,12 +761,8 @@ export default function (pi: ExtensionAPI): void {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const active = join(ctx);
       const name = slugify(params.room);
-      const room = readRoom(active.paths, name);
+      const room = addRoomMember(active.paths, name, active.name);
       if (room == null) return fail(`Room ${name} does not exist.`);
-      if (!room.members.includes(active.name)) {
-        room.members = uniqueMembers([...room.members, active.name]);
-        saveRoom(active.paths, room);
-      }
       return text(`Joined room ${name} (${room.members.length} members): ${room.members.join(", ")}.`, { room });
     },
   });
@@ -772,14 +788,18 @@ export default function (pi: ExtensionAPI): void {
       if (over != null) return fail(over);
       const body = sanitize(params.message);
       const recipients = room.members.filter((m) => m !== active.name);
+      // One id for the log line and the envelope: `receipts/<id>.json` then names
+      // a post that is actually in the history, instead of a uuid nothing records.
+      const id = randomUUID();
       const seq = appendPost(active.paths, name, {
+        id,
         from: active.name,
         text: body,
         sentAt: nowIso(),
         recipients,
       });
       deliver(active.paths, {
-        id: randomUUID(),
+        id,
         from: active.name,
         to: recipients,
         text: body,
