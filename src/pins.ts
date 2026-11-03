@@ -24,12 +24,19 @@
  * in `wE:p1B` from being inherited by whatever process next occupies `wE:p1B`.
  * A pin recorded without one — a fresh entry the operator typed by hand — is
  * applied to whoever claims it next and then stamped with that process.
+ *
+ * A pin can never grant a name reserved by a human participant. Pins are
+ * pid-and-starttime stamped and rejected by any process that did not write them,
+ * so they are not a reservation mechanism: `participants/<name>.json` is. A pin
+ * for a participant's name is therefore ignored at resolution, with a reason
+ * `rooms_pins` reports, rather than allowed to bypass the reservation in
+ * `claimName`.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { isValidName, listAgents, procIdentity, sameProcessStart, slugify, type Paths } from "./store.ts";
+import { isReservedName, isValidName, listAgents, procIdentity, sameProcessStart, slugify, type Paths } from "./store.ts";
 
 export interface PinEntry {
   name: string;
@@ -173,6 +180,18 @@ export function resolvePin(paths: Paths, ctx: ResolveContext): ResolvedPin | nul
       rejected = rejected ?? {
         key,
         reason: `"${entry.name}" is not a valid name (lowercase letters, digits, dash, underscore)`,
+      };
+      continue;
+    }
+    // A human's name is reserved in the store, not by this file. Honouring the
+    // pin would make the pin the reservation mechanism, which it cannot be: a
+    // pin is only honoured by the process that stamped it.
+    if (isReservedName(paths, entry.name)) {
+      rejected = rejected ?? {
+        key,
+        reason:
+          `"${entry.name}" is reserved by a human participant in participants/${entry.name}.json, ` +
+          `so this pin is ignored`,
       };
       continue;
     }
