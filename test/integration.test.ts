@@ -15,10 +15,12 @@ import init from "../index.ts";
 
 import {
   archive,
+  createParticipant,
   drain,
   readPosts,
   register,
   resolvePaths,
+  writePresence,
 } from "../src/store.ts";
 
 interface Recorded {
@@ -303,4 +305,153 @@ test("a bare pin key is treated as a session id", async () => {
   await call(ext, "rooms_pins", { action: "set", key: "abc123", name: "by-session" }, "/work/solo");
   const listed = await call(ext, "rooms_pins", {}, "/work/solo");
   assert.match(listed.content[0].text, /session:abc123\s+by-session/);
+});
+
+// ---------------------------------------------------------------------------
+// P4 — human participants in rooms_who
+// ---------------------------------------------------------------------------
+
+/** The output `rooms_who` produced before humans existed, for the no-human case. */
+async function whoWithoutHumans(): Promise<string> {
+  const dir = base();
+  const ext = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "plugin-eval" });
+  await ext.handlers.get("session_start")!({}, ctx("/work/eval"));
+  const who = await call(ext, "rooms_who", {}, "/work/eval");
+  return who.content[0].text as string;
+}
+
+test("rooms_who shows a human participant with its derived presence", async () => {
+  const dir = base();
+  const paths = resolvePaths(dir);
+  createParticipant(paths, { name: "operator", displayName: "Alex", createdBy: "overlord" });
+  writePresence(paths, {
+    name: "operator",
+    state: "online",
+    lastSeenAt: new Date().toISOString(),
+    leaseUntil: new Date(Date.now() + 60_000).toISOString(),
+    client: "herdr-plugin",
+    note: null,
+  });
+
+  const ext = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "plugin-eval" });
+  // Join first, so the roster has a live agent beside the human.
+  await ext.handlers.get("session_start")!({}, ctx("/work/eval"));
+  const who = await call(ext, "rooms_who", {}, "/work/eval");
+  const body = who.content[0].text as string;
+
+  assert.match(body, /1 human participant\(s\)/);
+  assert.match(body, /operator\s+online \(\d+s\) \(Alex\)/);
+  assert.match(body, /via herdr-plugin/);
+  // The agent roster is untouched by the human section.
+  assert.match(body, /plugin-eval/);
+  // The details carry the record, so a caller need not parse the text.
+  assert.equal(who.details.humans[0].participant.name, "operator");
+  assert.equal(who.details.humans[0].presence.state, "online");
+});
+
+test("a stale lease renders as away with an age, never as live", async () => {
+  const dir = base();
+  const paths = resolvePaths(dir);
+  createParticipant(paths, { name: "operator", createdBy: "overlord" });
+  // 23 minutes since the last heartbeat: the plan's own example render.
+  const seen = Date.now() - 23 * 60 * 1000;
+  writePresence(paths, {
+    name: "operator",
+    state: "online",
+    lastSeenAt: new Date(seen).toISOString(),
+    leaseUntil: new Date(seen + 60_000).toISOString(),
+    client: "herdr-plugin",
+    note: null,
+  });
+
+  const ext = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "plugin-eval" });
+  const who = await call(ext, "rooms_who", {}, "/work/eval");
+  const body = who.content[0].text as string;
+
+  assert.match(body, /operator\s+away \(2[34]m\)/, "stale lease is away with its age");
+  assert.equal(who.details.humans[0].presence.state, "away");
+  // Nothing in the human section may imply liveness.
+  assert.doesNotMatch(body, /\bonline\b/);
+  assert.doesNotMatch(body, /\blive\b/);
+});
+
+test("a human with no presence record at all reads unknown, not offline", async () => {
+  const dir = base();
+  createParticipant(resolvePaths(dir), { name: "operator", createdBy: "overlord" });
+  const ext = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "plugin-eval" });
+  const who = await call(ext, "rooms_who", {}, "/work/eval");
+  assert.match(who.content[0].text, /operator\s+unknown/);
+  assert.doesNotMatch(who.content[0].text, /offline/);
+});
+
+test("zero human participants leaves rooms_who output exactly as it was", async () => {
+  const body = await whoWithoutHumans();
+  // The pre-existing shape, unchanged: count line, then the self row.
+  assert.match(body, /^1 agent\(s\) · you are plugin-eval\n/);
+  assert.doesNotMatch(body, /human/i, "no empty heading is added");
+  assert.doesNotMatch(body, /lease|liveness|provenance/i, "no footnote is added");
+});
+
+test("rooms_who's description carries both plan caveats", async () => {
+  const ext = loadExtension({ PI_ROOMS_DIR: base(), PI_ROOMS_NAME: "solo" });
+  const description = ext.tools.get("rooms_who").description as string;
+  // §2.4: away does not mean the human is ignoring the lane.
+  assert.match(description, /away/i);
+  assert.match(description, /ignoring/i);
+  assert.match(description, /at the keyboard/i);
+  // §2.2 Provenance: via/client is self-declared, not authentication.
+  assert.match(description, /self-declared/i);
+  assert.match(description, /not authenticated|never as a control/i);
+});
+
+test("no tool can set a human's presence", () => {
+  const ext = loadExtension({ PI_ROOMS_DIR: base(), PI_ROOMS_NAME: "solo" });
+  assert.equal(ext.tools.has("rooms_set_presence"), false);
+  assert.equal(
+    [...ext.tools.keys()].some((name) => /persistence|presence/i.test(name)),
+    false,
+    "presence is read-only for lanes",
+  );
+});
+
+test("a human's name is withheld from a lane that asks for it by pin or by env", async () => {
+  const dir = base();
+  const paths = resolvePaths(dir);
+  createParticipant(paths, { name: "operator", createdBy: "overlord" });
+
+  // By environment: the explicit name is what beats every pin, so it is the
+  // most direct attempt at the human's identity.
+  const byEnv = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "operator" });
+  const envWho = await call(byEnv, "rooms_who", {}, "/work/x");
+  assert.equal(envWho.details.self === "operator", false, "the env name did not take the human's name");
+  assert.match(envWho.details.self as string, /^operator-/);
+  assert.equal(fs.existsSync(path.join(dir, "registry", "operator.json")), false);
+
+  // By pin: the pin resolves to the human's name and must not be honoured.
+  //
+  // The pin is rejected at *resolution* (pins.ts), one step before `claimName` is
+  // ever reached, because a pin is pid-and-starttime stamped and therefore
+  // cannot be a reservation mechanism. So the lane keeps its derived name rather
+  // than gaining an `operator-`-suffixed one: the pin simply does not apply.
+  fs.writeFileSync(
+    path.join(dir, "names.json"),
+    JSON.stringify({ pins: { "session:s-pin": { name: "operator" } } }),
+  );
+  fs.rmSync(path.join(dir, "registry"), { recursive: true, force: true });
+  // PI_ROOMS_NAME is set to the empty string, which `refreshName` treats as
+  // absent, so the pin path is the one reached. An explicit empty value is used
+  // rather than deleting the variable, so this test does not depend on the
+  // order the file's tests happen to run in.
+  const byPin = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "" });
+  process.env.PI_SESSION_ID = "s-pin";
+  const pinWho = await call(byPin, "rooms_who", {}, "/work/x");
+  assert.equal(pinWho.details.self === "operator", false, "the pin did not take the human's name");
+  assert.doesNotMatch(pinWho.details.self as string, /^operator/, "the pin was ignored, not suffixed");
+  assert.equal(fs.existsSync(path.join(dir, "registry", "operator.json")), false);
+
+  // And the operator can see why the pin is ignored, rather than see it silently
+  // do nothing — an ignored pin looks identical to an absent one otherwise.
+  const listed = await call(byPin, "rooms_pins", {}, "/work/x");
+  assert.match(listed.content[0].text, /being ignored/);
+  assert.match(listed.content[0].text, /reserved by a human participant/);
 });

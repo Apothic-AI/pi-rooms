@@ -11,6 +11,15 @@
  *   inbox/<name>/read/*.json      delivered messages, kept for reply_all lookup
  *   rooms/<room>/room.json        room metadata: members, creator
  *   rooms/<room>/log.jsonl        append-only room history, one post per line
+ *   participants/<name>.json      a human identity: no pid, no process
+ *   presence/<name>.json          a human's declared presence, expired on read
+ *
+ * The last two are new directories that no older build reads. A human lives in
+ * `participants/` and never in `registry/`, because `listAgents` unlinks every
+ * registration whose process it cannot find — an unrelated lane reading the
+ * roster would delete a person's identity. Presence for a human is a lease
+ * derived at read time, never a pid probed with `kill(pid, 0)`: there is no
+ * process to find, and claiming one would be a lie the whole design avoids.
  *
  * Liveness is a pid *plus* the identity of the process behind it. A bare pid is
  * not enough: after a reboot the same number is handed to an unrelated process,
@@ -119,6 +128,10 @@ export interface Paths {
   inbox: string;
   rooms: string;
   receipts: string;
+  /** Human identity records. Never pruned, never probed for a pid. */
+  participants: string;
+  /** Human presence leases, written by a client and expired on read. */
+  presence: string;
 }
 
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
@@ -139,6 +152,8 @@ export function resolvePaths(base: string): Paths {
     inbox: path.join(base, "inbox"),
     rooms: path.join(base, "rooms"),
     receipts: path.join(base, "receipts"),
+    participants: path.join(base, "participants"),
+    presence: path.join(base, "presence"),
   };
 }
 
@@ -406,20 +421,49 @@ export function listAgents(paths: Paths): Registration[] {
  * A name already held by another live process is never taken over; the caller
  * gets a suffixed variant instead. Two agents silently sharing one name would
  * merge two inboxes into one, which is the failure this prevents.
+ *
+ * A **human participant's name is reserved even when no process holds it**, and
+ * that is the whole point of doing this here rather than in a client. For a
+ * human `readRegistration` returns null, so without this check the first
+ * condition below would grant the name unsuffixed, silently, to whichever lane
+ * derived or pinned it — including a lane that merely started in the wrong tab.
+ * Any room member may DM the human, so that collision is the difference between
+ * a person's mailbox and a lane's. The reservation lives here because this is
+ * the only place a name is granted.
  */
 export function claimName(paths: Paths, desired: string, pid: number): string {
   const base = isValidName(desired) ? desired : slugify(desired);
   let candidate = base;
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    const existing = readRegistration(paths, candidate);
-    if (existing == null || !isRegistrationLive(existing) || existing.pid === pid) return candidate;
+    // Checked before the registration test: a reserved name has no live
+    // registration to collide with, which is exactly why it needs a rule.
+    if (!isReservedName(paths, candidate)) {
+      const existing = readRegistration(paths, candidate);
+      if (existing == null || !isRegistrationLive(existing) || existing.pid === pid) return candidate;
+    }
+    // The suffixing is the loop's own, unchanged: an attempt-0 miss yields
+    // `<base>-<pid>` and every later attempt adds a counter. No new scheme.
     candidate = `${base.slice(0, 44)}-${pid}`;
     if (attempt > 0) candidate = `${base.slice(0, 40)}-${pid}-${attempt}`;
   }
   return `${base.slice(0, 40)}-${pid}-${randomUUID().slice(0, 4)}`;
 }
 
+/**
+ * Write a registration.
+ *
+ * Refuses a reserved participant name outright instead of renaming: `claimName`
+ * is the renamer, and a caller that reached this point with a human's name has a
+ * bug rather than a preference. Renaming silently here would hide that bug and
+ * leave the caller believing it owns a name it does not.
+ */
 export function register(paths: Paths, entry: Registration): void {
+  if (isReservedName(paths, entry.name)) {
+    throw new Error(
+      `Refusing to register ${entry.name}: the name is reserved by a human participant in ` +
+        `${paths.participants}. Claim a different name with claimName instead.`,
+    );
+  }
   writeJsonAtomic(path.join(paths.registry, `${entry.name}.json`), entry);
 }
 
@@ -429,6 +473,321 @@ export function unregister(paths: Paths, name: string): void {
   } catch {
     /* already gone */
   }
+}
+
+// ---------------------------------------------------------------------------
+// Human participants
+// ---------------------------------------------------------------------------
+
+/**
+ * A human's identity record, from `participants/<name>.json`.
+ *
+ * This is not a {@link Registration}: there is no pid, no cwd, no process. A
+ * human is a principal with a mailbox, and the only code paths that could treat
+ * them as a process are the ones that read `registry/`.
+ *
+ * `kind` is a string and not a closed enum. v1 writes `"human"`; a reader that
+ * rejected an unknown kind would make this file a compatibility hazard for
+ * every later kind of participant, and nothing here needs to branch on it.
+ */
+export interface Participant {
+  name: string;
+  kind: string;
+  /** Arbitrary text shown next to the name. Never a key, never in a path. */
+  displayName?: string | null;
+  createdBy: string;
+  createdAt: string;
+  client?: {
+    id: string;
+    label: string;
+    /** sha256 of the client token. A lock against two clients interleaving, not a credential. */
+    tokenSha256?: string;
+  };
+}
+
+export interface ParticipantClient {
+  id: string;
+  label: string;
+  tokenSha256?: string;
+}
+
+export interface NewParticipant {
+  name: string;
+  kind?: string;
+  displayName?: string | null;
+  createdBy: string;
+  client?: ParticipantClient;
+  /** Fixed creation stamp, for tests. Defaults to now. */
+  createdAt?: string;
+}
+
+function participantPath(paths: Paths, name: string): string {
+  return path.join(paths.participants, `${name}.json`);
+}
+
+/**
+ * One participant record, or null when there is none or it cannot be read.
+ *
+ * `displayName` never reaches this path: the file name comes from `name` alone,
+ * so a display name containing `/`, a space or anything else is harmless. A
+ * record whose stored `name` disagrees with the file it was found in is treated
+ * as absent, because the file name is the reservation key and a mismatch means
+ * the record does not describe the name it is reserving.
+ */
+export function readParticipant(paths: Paths, name: string): Participant | null {
+  if (!isValidName(name)) return null;
+  const record = readJson<Participant>(participantPath(paths, name));
+  if (record == null || typeof record !== "object") return null;
+  if (typeof record.name !== "string" || record.name !== name) return null;
+  if (typeof record.kind !== "string" || record.kind.length === 0) return null;
+  return record;
+}
+
+/**
+ * Every participant record that parses.
+ *
+ * Read-only: unlike {@link listAgents} this never unlinks anything. A corrupt
+ * record is skipped rather than deleted, because deleting a human's identity is
+ * the one failure this design exists to prevent.
+ */
+export function listParticipants(paths: Paths): Participant[] {
+  let files: string[];
+  try {
+    files = fs.readdirSync(paths.participants).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const out: Participant[] = [];
+  for (const file of files) {
+    const name = file.slice(0, -".json".length);
+    const record = readParticipant(paths, name);
+    if (record != null) out.push(record);
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Whether a name belongs to a human participant.
+ *
+ * True iff a readable participant record exists. An unreadable file is *not* a
+ * reservation: a record nobody can parse cannot be honoured by `register`
+ * either, and treating it as one would wedge the name with no way to see why.
+ */
+export function isReservedName(paths: Paths, name: string): boolean {
+  return readParticipant(paths, name) != null;
+}
+
+/**
+ * Write a participant record.
+ *
+ * Rejects a `name` that is not `NAME_RE`-valid. That is load-bearing rather than
+ * cosmetic: `uniqueMembers` drops any member failing `isValidName` on the
+ * `room.json` rewrite path, so a human whose name did not validate would be
+ * silently ejected from every room by the next lane that joined one.
+ */
+export function saveParticipant(paths: Paths, participant: Participant): Participant {
+  if (!isValidName(participant.name)) {
+    throw new Error(
+      `Participant name ${JSON.stringify(participant.name)} is not a valid rooms name: ` +
+        `lowercase letters, digits, dash or underscore, up to 48 characters. ` +
+        `A display name goes in displayName, which is never used as a path.`,
+    );
+  }
+  if (typeof participant.kind !== "string" || participant.kind.length === 0) {
+    throw new Error(`Participant ${participant.name} needs a non-empty kind (v1 writes "human").`);
+  }
+  writeJsonAtomic(participantPath(paths, participant.name), participant);
+  return participant;
+}
+
+/**
+ * Create a participant record, defaulting to a human.
+ *
+ * The extension-side entry point. Deliberately not a `rooms_*` tool: exposing it
+ * to a model turn would let any lane invent a principal, and the tool surface is
+ * a separate decision from the storage primitive.
+ */
+export function createParticipant(paths: Paths, spec: NewParticipant): Participant {
+  const existing = readParticipant(paths, spec.name);
+  if (existing != null) return existing;
+  return saveParticipant(paths, {
+    name: spec.name,
+    kind: spec.kind ?? "human",
+    displayName: spec.displayName ?? null,
+    createdBy: spec.createdBy,
+    createdAt: spec.createdAt ?? new Date().toISOString(),
+    client: spec.client,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Presence
+// ---------------------------------------------------------------------------
+
+/** The states a presence record may declare. */
+export type PresenceState = "online" | "away" | "offline" | "unknown";
+
+/**
+ * How long after a lease expires a human still reads as `away` rather than
+ * `offline`.
+ *
+ * A client sends a heartbeat every 20s with a 60s lease, so a lease that has
+ * expired means only that *this minute's* heartbeat was missed — a laptop lid, a
+ * wifi blip, a client restart. Thirty minutes is the plan's own unit of \"a
+ * human stepping out\": §2.4 and §3.4 both render a stale lease as
+ * `away (23m)`, which is only true if the window is longer than 23 minutes. A
+ * shorter window would make the plan's own example read `offline`, and a longer
+ * one would let a client that has been gone all day still claim `away`.
+ */
+export const PRESENCE_GRACE_MS = 30 * 60 * 1000;
+
+/**
+ * A presence record, as written by a client.
+ *
+ * No pid, no proc identity, no liveness stamp. A human has no process, so there
+ * is nothing here to probe, and `isRegistrationLive` is never applied to one.
+ */
+export interface Presence {
+  name: string;
+  /** What the client declared. `offline`/`unknown` are never stored by v1 clients. */
+  state: PresenceState;
+  lastSeenAt: string;
+  leaseUntil: string;
+  client?: string;
+  note?: string | null;
+}
+
+/** A presence record plus everything derived from it at read time. */
+export interface PresenceView {
+  name: string;
+  /** Effective state: declared `away` honoured, everything else derived from the lease. */
+  state: PresenceState;
+  /** What the record declared, for a reader that wants to distinguish derived from written. */
+  declared: PresenceState;
+  lastSeenAt: string | null;
+  leaseUntil: string | null;
+  client?: string;
+  note?: string | null;
+  /** Milliseconds since the last heartbeat, or null when there is no record. */
+  ageMs: number | null;
+  /** True when the record exists and parses but derives to nothing better than unknown. */
+  present: boolean;
+}
+
+const PRESENCE_STATES: readonly PresenceState[] = ["online", "away", "offline", "unknown"];
+
+function isPresenceState(value: unknown): value is PresenceState {
+  return typeof value === "string" && (PRESENCE_STATES as readonly string[]).includes(value);
+}
+
+function parseInstant(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const stamp = Date.parse(value);
+  return Number.isFinite(stamp) ? stamp : null;
+}
+
+/**
+ * Write a presence lease. The writer is a client; the only writer is a human's own
+ * client, and no `rooms_*` tool reaches this function.
+ *
+ * The record is stored as declared. Expiry is not applied here: a stored
+ * `offline` would be a decision frozen at write time, while the same file read
+ * later must answer differently. That is why every derived state is computed in
+ * {@link readPresence} instead.
+ */
+export function writePresence(paths: Paths, presence: Presence): Presence {
+  if (!isValidName(presence.name)) {
+    throw new Error(`Presence name ${JSON.stringify(presence.name)} is not a valid rooms name.`);
+  }
+  if (!isPresenceState(presence.state)) {
+    throw new Error(`Presence state must be online, away, offline or unknown.`);
+  }
+  writeJsonAtomic(path.join(paths.presence, `${presence.name}.json`), presence);
+  return presence;
+}
+
+/**
+ * Presence for one name, with the effective state derived from the clock.
+ *
+ * Pure with respect to the store: it never writes, never prunes and never
+ * probes. Calling it twice with the same `now` gives the same answer, which is
+ * what makes it safe to call from a tool that any lane may run.
+ *
+ * The derivation, in order:
+ *
+ * 1. no readable record → `unknown`. Absence is not evidence a person is gone;
+ *    there is simply nothing declared.
+ * 2. an explicitly declared `away` (or `offline`) → that word, whatever the
+ *    lease says. A person who said they stepped out is not overruled by a timer.
+ * 3. lease in the future → `online`.
+ * 4. lease expired but the last evidence within {@link PRESENCE_GRACE_MS} →
+ *    `away`.
+ * 5. otherwise → `offline`, but only where there *is* a timestamp to be stale.
+ *    A record carrying no usable instant at all is `unknown`, for the same
+ *    reason a missing file is: `offline` is a claim about a person, and there is
+ *    nothing here to support it.
+ */
+export function readPresence(paths: Paths, name: string, now: number = Date.now()): PresenceView {
+  const absent: PresenceView = {
+    name,
+    state: "unknown",
+    declared: "unknown",
+    lastSeenAt: null,
+    leaseUntil: null,
+    ageMs: null,
+    present: false,
+  };
+  if (!isValidName(name)) return absent;
+  const record = readJson<Presence>(path.join(paths.presence, `${name}.json`));
+  if (record == null || typeof record !== "object") return absent;
+  const declared = isPresenceState(record.state) ? record.state : "unknown";
+  const leaseUntil = parseInstant(record.leaseUntil);
+  const lastSeenAt = parseInstant(record.lastSeenAt);
+  const ageMs = lastSeenAt == null ? null : Math.max(0, now - lastSeenAt);
+  const freshLease = leaseUntil != null && leaseUntil > now;
+  // The instant the grace window is measured from. `lastSeenAt` is the honest
+  // answer; when a record only carries a lease, the lease is the last thing it
+  // said about the human, so it stands in rather than leaving the window
+  // undefined.
+  const evidence = lastSeenAt ?? leaseUntil;
+
+  let state: PresenceState;
+  if (declared === "away" || declared === "offline") {
+    // A declaration always wins over a timer. Only a client writes either word,
+    // so honouring the lease instead would let a stale heartbeat overrule a
+    // person who said they had left.
+    state = declared;
+  } else if (declared === "unknown") {
+    // A client that explicitly declared nothing declared nothing; the word is
+    // not a licence to infer a state from the clock.
+    state = "unknown";
+  } else if (freshLease) state = "online";
+  else if (evidence == null) state = "unknown";
+  else if (now - evidence <= PRESENCE_GRACE_MS) state = "away";
+  else state = "offline";
+
+  return {
+    name,
+    state,
+    declared,
+    lastSeenAt: typeof record.lastSeenAt === "string" ? record.lastSeenAt : null,
+    leaseUntil: typeof record.leaseUntil === "string" ? record.leaseUntil : null,
+    client: typeof record.client === "string" ? record.client : undefined,
+    note: typeof record.note === "string" ? record.note : null,
+    ageMs,
+    present: true,
+  };
+}
+
+/** Every participant with its derived presence, sorted by name. */
+export function listPresence(
+  paths: Paths,
+  now: number = Date.now(),
+): Array<{ participant: Participant; presence: PresenceView }> {
+  return listParticipants(paths).map((participant) => ({
+    participant,
+    presence: readPresence(paths, participant.name, now),
+  }));
 }
 
 // ---------------------------------------------------------------------------
