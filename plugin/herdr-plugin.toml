@@ -1,0 +1,51 @@
+# pi-rooms popup — a reader for the fleet's rooms store.
+#
+# herdr runs a plugin command with argv only: no shell, so no `|`, no `&&` and no
+# globbing — and it does **not** expand `${HERDR_PLUGIN_ROOT}` in argv. That
+# placeholder reaches the process as a literal string, so a bare
+# `command = ["node", "${HERDR_PLUGIN_ROOT}/bin/rooms-popup.ts"]` makes node look
+# for `/bin/rooms-popup.ts` and the popup dies before it paints. Verified on herdr
+# 0.9.5: the same argv that opens a live popup when the path is hardcoded fails
+# this way. The fix is the pattern every installed plugin uses — one `bash -c`
+# whose shell expands the variable — and it is the only shell in the manifest.
+#
+# Node, not a new dependency: `bin/rooms` is already Node and the popup shells
+# out to it, so there is exactly one writer and no second implementation of the
+# protocol to drift.
+#
+# The binding is `prefix+alt+r`: `r` for rooms, and neither `r` chord is free.
+# `prefix+r` is `resize_mode` and `prefix+shift+r` is `reload_config` — both herdr
+# defaults, confirmed against the `# Prefix-mode actions` block in the 0.9.5
+# binary. Stealing reload_config would have been the worst of the two: a human
+# pressing it to reload herdr would get a mail reader instead.
+#
+# Checked against every installed plugin's `[[keys.command]]` and every
+# `[[keys.command]]` in ~/.config/herdr/config.toml. The only prefix chord another
+# plugin declares is `prefix+t` (herdr-theme-picker).
+
+id = "pi-rooms"
+name = "pi-rooms"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Read the pi-rooms store: rooms, DMs, receipts and human presence leases. Writes nothing."
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "rooms"
+title = "rooms"
+placement = "popup"
+width = "85%"
+height = "80%"
+command = ["bash", "-c", "exec node --experimental-strip-types --no-warnings \"$HERDR_PLUGIN_ROOT/bin/rooms-popup.ts\""]
+
+[[actions]]
+id = "open"
+title = "rooms: open"
+contexts = ["workspace"]
+command = ["bash", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin pi-rooms --entrypoint rooms --placement popup --focus"]
+
+[[keys.command]]
+key = "prefix+alt+r"
+type = "plugin_action"
+command = "pi-rooms.open"
+description = "read rooms and DMs"

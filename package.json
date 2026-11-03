@@ -37,11 +37,13 @@
     "index.ts",
     "bin",
     "src",
+    "plugin",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts plugin/test/*.test.ts",
+    "test:plugin": "node --experimental-strip-types --test plugin/test/*.test.ts",
     "typecheck": "tsc -p ."
   },
   "peerDependencies": {
