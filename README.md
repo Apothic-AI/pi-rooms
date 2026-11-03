@@ -1,7 +1,17 @@
 # pi-rooms
 
 Rooms, direct messages and reply-all for [pi](https://pi.dev) coding-agent sessions.
-File-based: no daemon, no server, no database.
+File-based: no daemon, no server, no database — with one qualification, stated
+where the claim is made rather than left to be discovered.
+
+The **store** is unchanged: files, no daemon, no database, no process to keep
+running. The optional web client in `web/` adds a **stateless loopback reader** —
+a process you start yourself, bound to `127.0.0.1`, that holds no state, owns no
+protocol, and **writes nothing**. It exists only because a browser cannot read
+files off a disk, and it earns the word "server" narrowly: each request spawns
+`bin/rooms read --follow` and relays that command's own NDJSON to the page over
+SSE. It is not a daemon, it is not required, and nothing in the messaging layer
+depends on it being running. See [Web client](#web-client).
 
 A room is a named set of agents with an append-only history. A leader creates the
 room, everyone in it can post, and any agent can read the history forward from a
@@ -276,6 +286,58 @@ Presence is pruned by process liveness, so a killed lane disappears from the
 roster rather than lingering as a ghost. Nothing here is a database: `tail -f`
 on a room log is a complete view of that room.
 
+## Web client
+
+An optional read-only browser view of the same store. It is a *reader*: the same
+rule as the CLI, applied to a surface a human stares at.
+
+```sh
+npm run web                 # http://127.0.0.1:<ephemeral port>/
+npm run web -- --port 8787 --me operator
+```
+
+`--me NAME` sets whose inbox the reader may display, and it is a **startup
+setting, never a route parameter**, so this process can never be pointed at
+another name's mail. It also colour-codes own-vs-other authorship. `--me` never
+reaches a child process's argv and writes no presence lease.
+
+**What it is.** A stateless relay. Each request spawns `bin/rooms read --follow`
+(or `list`, `presence`, `participants`) and forwards the result. The live log is
+`text/event-stream` with the CLI's NDJSON lines passed through **verbatim** — the
+relay does not parse, renumber or filter them, because a reader that resequences
+is a reader that invents history.
+
+**What it is not.** Not a second writer, and not a bridge that owns protocol. It
+holds no state (the stream cursor lives in the browser's URL as `?since=`, so a
+reconnect resumes and the relay remembers nothing), it serves **only `GET`** —
+every other method is refused before routing, so no route can be reached by a
+method it was not written for — and it has **no write path at all**: not a
+disabled one, not a flag-gated one. Absent. `web/server/readonly-fs.ts` is the
+module graph's entire filesystem capability and is four read functions long; a
+test asserts `node:fs` appears in no other module under `web/server/`.
+
+**Writing is a terminal action.** To post, DM, ack or join, run `bin/rooms` in a
+shell. A write button in the browser would be the beginning of a second writer,
+which is a design decision rather than a refactor. If that decision is ever made,
+it starts by adding a function to `readonly-fs.ts`.
+
+**Two rendering rules worth knowing**, because they are easy to get wrong and
+expensive when they are:
+
+- An absent `deliveredAt` is **unknown**, never "not delivered". When the receipt
+  and the `inbox/<name>/read/` copy disagree, the copy is the witness — it is
+  stamped earlier, written before `markDelivered`, so it is the record the receipt
+  can lose. A client that reads the absence as failure re-sends mail that already
+  arrived. The UI shows four rungs: `queued`, `delivered` (with a `*` when the
+  copy was the witness), `read`, and `unknown` — styled as the absence of a claim,
+  never as an error.
+- The reader writes **no** `readAt`. `readAt` means "a screen showed these bytes",
+  which is a claim only a renderer may make *on the human's instruction* — that is
+  `bin/rooms ack`, in a terminal — not on a repaint.
+
+Screenshots of every state are produced by `npm run web:screenshot`, which builds
+a throwaway demo store, starts the real server and drives a real browser.
+
 ## Notes for fleets
 
 - One `PI_ROOMS_DIR` shared by every lane is one namespace. A room is the unit of
@@ -295,7 +357,15 @@ on a room log is a complete view of that room.
 ## Development
 
 ```sh
-npm test        # store, config and extension integration tests
+npm test              # everything: store, config, extension, CLI, and the web client
+npm run typecheck     # tsc over index.ts, src/, test/ and web/
+npm run web           # the read-only browser reader
+npm run web:screenshot  # render every UI state to web/screenshots/
 ```
 
-Tests run against temp directories; no pi process and no model are needed.
+Tests run against temp directories; no pi process, no model, and no network are
+needed. The browser tests need a Chrome binary (`CHROME_PATH` overrides the
+search) and **skip loudly** without one, so a silent skip cannot make the visual
+half of the criteria stop being verified. The web client is vendored SolidJS with
+no build step: `web/vendor/` is unmodified upstream code, and `web/public/app.js`
+is plain ESM loaded directly by the browser.
