@@ -24,12 +24,28 @@
  * in `wE:p1B` from being inherited by whatever process next occupies `wE:p1B`.
  * A pin recorded without one — a fresh entry the operator typed by hand — is
  * applied to whoever claims it next and then stamped with that process.
+ *
+ * A pin can never grant a name reserved by a human participant. Pins are
+ * pid-and-starttime stamped and rejected by any process that did not write them,
+ * so they are not a reservation mechanism: `participants/<name>.json` is. A pin
+ * for a participant's name is therefore ignored at resolution, with a reason
+ * `rooms_pins` reports, rather than allowed to bypass the reservation in
+ * `claimName`.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { isValidName, listAgents, procIdentity, sameProcessStart, slugify, type Paths } from "./store.ts";
+import {
+  isReservedName,
+  isValidName,
+  listAgents,
+  procIdentity,
+  sameProcessStart,
+  slugify,
+  withFileLock,
+  type Paths,
+} from "./store.ts";
 
 export interface PinEntry {
   name: string;
@@ -148,6 +164,31 @@ export function writePinFile(paths: Paths, file: PinFile): void {
   fs.renameSync(tmp, pinPath(paths));
 }
 
+/**
+ * Read-modify-write of the pin file, holding a lock across both halves.
+ *
+ * `names.json` is shared by every lane in the fleet, and two lanes claiming or
+ * releasing pins at the same moment each read the old file and write their own
+ * version — one claim silently disappears. The lock spans the read for that
+ * reason; locking only {@link writePinFile} would still lose the loser's update.
+ *
+ * The edit reports whether it changed anything, so a read-only call does not
+ * rewrite the file and hands back what it computed. `writePinFile` stays the raw,
+ * unlocked writer for setup code and tests; calling it from inside `editPins`
+ * would try to take a lock this process already holds.
+ */
+export function editPins<T>(
+  paths: Paths,
+  edit: (file: PinFile) => { changed: boolean; value: T },
+): T {
+  return withFileLock(pinPath(paths), () => {
+    const file = readPinFile(paths);
+    const { changed, value } = edit(file);
+    if (changed) writePinFile(paths, file);
+    return value;
+  });
+}
+
 /** The keys that could apply to this process, highest priority first. */
 export function candidateKeys(ctx: ResolveContext): string[] {
   const keys: string[] = [];
@@ -173,6 +214,18 @@ export function resolvePin(paths: Paths, ctx: ResolveContext): ResolvedPin | nul
       rejected = rejected ?? {
         key,
         reason: `"${entry.name}" is not a valid name (lowercase letters, digits, dash, underscore)`,
+      };
+      continue;
+    }
+    // A human's name is reserved in the store, not by this file. Honouring the
+    // pin would make the pin the reservation mechanism, which it cannot be: a
+    // pin is only honoured by the process that stamped it.
+    if (isReservedName(paths, entry.name)) {
+      rejected = rejected ?? {
+        key,
+        reason:
+          `"${entry.name}" is reserved by a human participant in participants/${entry.name}.json, ` +
+          `so this pin is ignored`,
       };
       continue;
     }
@@ -210,28 +263,27 @@ export function claimPin(paths: Paths, ctx: ResolveContext): ResolvedPin | null 
   if (resolved == null || resolved.name.length === 0) return resolved;
   if (!resolved.claimed) return resolved;
 
-  const file = readPinFile(paths);
-  const entry = file.pins[resolved.key];
-  if (entry == null) return { ...resolved, claimed: false };
-  const current = procIdentity(ctx.pid);
-  const slug = slugify(resolved.name);
-  file.pins[resolved.key] = { ...entry, name: slug, procId: current ?? undefined };
-  writePinFile(paths, file);
-  // `claimed` stays true: this call is the one that bound the pin to this
-  // process, and a caller that needs to know whether a claim happened (to log
-  // it, or to warn about a pin it just consumed) cannot infer it afterwards.
-  return { ...resolved, name: slug, claimed: true };
+  return editPins<ResolvedPin>(paths, (file): { changed: boolean; value: ResolvedPin } => {
+    const entry = file.pins[resolved.key];
+    if (entry == null) return { changed: false, value: { ...resolved, claimed: false } };
+    const current = procIdentity(ctx.pid);
+    const slug = slugify(resolved.name);
+    file.pins[resolved.key] = { ...entry, name: slug, procId: current ?? undefined };
+    // `claimed` stays true: this call is the one that bound the pin to this
+    // process, and a caller that needs to know whether a claim happened (to log
+    // it, or to warn about a pin it just consumed) cannot infer it afterwards.
+    return { changed: true, value: { ...resolved, name: slug, claimed: true } };
+  });
 }
 
 /** Release a pin claimed by a dead process, so the next occupant can use it. */
 export function releaseStalePin(paths: Paths, key: string): boolean {
-  const file = readPinFile(paths);
-  const entry = file.pins[key];
-  if (entry == null) return false;
-  if (entry.procId == null) return false;
-  delete file.pins[key];
-  writePinFile(paths, file);
-  return true;
+  return editPins(paths, (file) => {
+    const entry = file.pins[key];
+    if (entry == null || entry.procId == null) return { changed: false, value: false };
+    delete file.pins[key];
+    return { changed: true, value: true };
+  });
 }
 
 /** Every pin, with the name it resolves to. For diagnostics. */

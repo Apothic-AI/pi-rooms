@@ -30,8 +30,12 @@
       "./index.ts"
     ]
   },
+  "bin": {
+    "rooms": "./bin/rooms"
+  },
   "files": [
     "index.ts",
+    "bin",
     "src",
     "README.md",
     "LICENSE"

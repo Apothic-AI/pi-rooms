@@ -18,6 +18,7 @@ import { Type } from "typebox";
 
 import { loadConfig, type RoomsConfig } from "./src/config.ts";
 import {
+  addRoomMember,
   archive,
   appendPost,
   bootId,
@@ -27,12 +28,15 @@ import {
   deliver,
   drain,
   findReceived,
+  isReservedName,
   isValidName,
   isValidRoom,
   listAgents,
+  listParticipants,
   listRooms,
   procIdentity,
   readPosts,
+  readPresence,
   readRegistration,
   receiptPathFor,
   readRoom,
@@ -42,16 +46,23 @@ import {
   resolvePaths,
   roomSeq,
   sanitize,
-  saveRoom,
   slugify,
   unregister,
   uniqueMembers,
   type Delivery,
   type Paths,
+  type PresenceView,
   type Registration,
   type Room,
 } from "./src/store.ts";
-import { claimPin, listPins, pinPath, readPinFile, resolvePin, writePinFile } from "./src/pins.ts";
+import {
+  claimPin,
+  editPins,
+  listPins,
+  pinPath,
+  readPinFile,
+  resolvePin,
+} from "./src/pins.ts";
 
 interface SessionState {
   name: string;
@@ -78,6 +89,30 @@ function fail(body: string, details: Record<string, unknown> = {}) {
   return { content: [{ type: "text" as const, text: body }], details, isError: true };
 }
 
+/** Compact age for a presence line: 45s, 23m, 6h, 4d. */
+function formatAge(ms: number): string {
+  const secs = Math.floor(ms / 1000);
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+/**
+ * How one human's presence renders in `rooms_who`.
+ *
+ * The age is always the honest part of the line: `online (3s)` means a lease is
+ * live and was refreshed 3s ago, while `away (23m)` means the last thing this
+ * person's client declared was 23 minutes ago. Neither word is `live`, and
+ * nothing here reads a pid, because there is none to read.
+ */
+function presenceLabel(presence: PresenceView): string {
+  const age = presence.ageMs != null ? ` (${formatAge(presence.ageMs)})` : "";
+  return `${presence.state}${age}`;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -101,15 +136,25 @@ export default function (pi: ExtensionAPI): void {
    * lets an operator pin a name for a lane that is already running: the next
    * call picks the pin up. An explicit `PI_ROOMS_NAME` short-circuits the pin
    * file entirely, so a pin can never override it.
+   *
+   * Neither source can grant a human participant's name. `claimName` reserves
+   * it, and both paths below can hand a name to this session without going
+   * through `claimName` — the environment by taking the slug as-is, a pin by
+   * overriding the derived name. Both are therefore passed through the same
+   * reservation check, so the collision is prevented at the seam rather than
+   * discovered when `register` throws on the next join.
    */
   function refreshName(active: SessionState, cwd: string): void {
     const explicit = (process.env.PI_ROOMS_NAME ?? process.env.PI_AGENT_NAME ?? "").trim();
     if (explicit.length > 0) {
       const slug = slugify(explicit);
       if (isValidName(slug)) {
-        if (active.name !== slug) {
+        const wanted = isReservedName(active.paths, slug)
+          ? claimName(active.paths, slug, process.pid)
+          : slug;
+        if (active.name !== wanted) {
           releaseClaimedName(active);
-          active.name = slug;
+          active.name = wanted;
           active.pinKey = null;
         }
         return;
@@ -121,10 +166,15 @@ export default function (pi: ExtensionAPI): void {
       cwd,
       pid: process.pid,
     });
-    if (resolved != null && resolved.name.length > 0 && resolved.name !== active.name) {
-      releaseClaimedName(active);
-      active.name = resolved.name;
-      active.pinKey = resolved.key;
+    if (resolved != null && resolved.name.length > 0) {
+      const wanted = isReservedName(active.paths, resolved.name)
+        ? claimName(active.paths, resolved.name, process.pid)
+        : resolved.name;
+      if (wanted !== active.name) {
+        releaseClaimedName(active);
+        active.name = wanted;
+        active.pinKey = resolved.key;
+      }
     }
   }
 
@@ -348,8 +398,16 @@ export default function (pi: ExtensionAPI): void {
     name: "rooms_who",
     label: "Rooms: who is here",
     description:
-      "List the pi agents currently live on this machine, with the directory and model each one runs in. " +
-      "Use it before messaging anyone, or to check whether a peer is still running.",
+      "List the pi agents currently live on this machine, with the directory and model each one runs in, " +
+      "plus any human participants and the presence each one last declared. " +
+      "Use it before messaging anyone, or to check whether a peer is still running.\n\n" +
+      "Two caveats, and both matter more than they look. A human's presence is a lease written by their own " +
+      "client and expired on read: `online` means a lease is live, `away` means the lease ran out or the " +
+      "person said they stepped out, and `unknown` means nothing has ever been declared. None of those is " +
+      "liveness, and `away` does **not** mean the human is ignoring you — they may be at the keyboard. " +
+      "Do not treat `away` as a reason to give up on a human you are waiting on.\n\n" +
+      "`via` and `client` provenance is self-declared, not authenticated. Nothing verifies who wrote a " +
+      "record or a message, so read provenance as a signal, never as a control the system enforced.",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
       const active = ensure(ctx);
@@ -363,13 +421,52 @@ export default function (pi: ExtensionAPI): void {
           `${a.model != null ? `  (${a.model})` : ""}`
         );
       });
-      const body =
+      const head =
         agents.length === 0
           ? "No agents registered."
           : `${agents.length} agent(s) · you are ${active.name}` +
             `${active.paneId != null ? ` at ${active.paneId}` : ""}\n` +
             `${lines.join("\n")}`;
-      return text(body, { self: active.name, pane: active.paneId, agents });
+
+      // Humans get a separate section, not a row in the agent list: their state
+      // is a lease, and a lease rendered inside a roster of live pids would be
+      // read as liveness. That is the failure this section exists to avoid.
+      const humans = listParticipants(active.paths);
+      const view = humans.map((human) => ({
+        human,
+        presence: readPresence(active.paths, human.name),
+      }));
+
+      if (view.length === 0) {
+        return text(head, { self: active.name, pane: active.paneId, agents, humans: [] });
+      }
+
+      const humanWidth = Math.min(24, Math.max(10, ...view.map((h) => h.human.name.length + 2)));
+      const humanLines = view.map(({ human, presence }) => {
+        const label = human.displayName != null && human.displayName.length > 0 ? ` (${human.displayName})` : "";
+        return (
+          `  ${human.name.padEnd(humanWidth)} ${presenceLabel(presence)}${label}` +
+          `${presence.client != null ? `  via ${presence.client}` : ""}`
+        );
+      });
+      const notes = view
+        .map(({ presence }) => presence.note)
+        .filter((note): note is string => typeof note === "string" && note.length > 0);
+      const footnote =
+        "\nHuman presence is a lease, not liveness: `away` never means the human is ignoring you, " +
+        "and a `via` label is self-declared rather than authenticated.";
+
+      return text(
+        `${head}\n\n${view.length} human participant(s)\n${humanLines.join("\n")}` +
+          (notes.length > 0 ? `\n${notes.map((n) => `  note: ${n}`).join("\n")}` : "") +
+          footnote,
+        {
+          self: active.name,
+          pane: active.paneId,
+          agents,
+          humans: view.map(({ human, presence }) => ({ participant: human, presence })),
+        },
+      );
     },
   });
 
@@ -435,10 +532,12 @@ export default function (pi: ExtensionAPI): void {
       const key = normaliseKey(active, params.key);
 
       if (action === "remove") {
-        const file = readPinFile(active.paths);
-        if (file.pins[key] == null) return fail(`No pin for ${key}.`);
-        delete file.pins[key];
-        writePinFile(active.paths, file);
+        const removed = editPins(active.paths, (file) => {
+          if (file.pins[key] == null) return { changed: false, value: false };
+          delete file.pins[key];
+          return { changed: true, value: true };
+        });
+        if (!removed) return fail(`No pin for ${key}.`);
         return text(`Removed pin ${key}.`, { key });
       }
 
@@ -476,8 +575,14 @@ export default function (pi: ExtensionAPI): void {
             `identity. Use action:"remove" to free it deliberately, or force:true.`,
         );
       }
-      file.pins[key] = { name: wanted, note: existing?.note };
-      writePinFile(active.paths, file);
+      // The claim check above is advisory and racy on purpose — it decides whether
+      // to *tell* the operator off, and `force` can override it. The write below is
+      // the locked read-modify-write, so a concurrent pin for a different key
+      // cannot be lost. The `existing` note is re-read inside the lock.
+      editPins(active.paths, (inner) => {
+        inner.pins[key] = { name: wanted, note: inner.pins[key]?.note };
+        return { changed: true, value: undefined };
+      });
 
       const appliesHere =
         (active.sessionId != null && key === `session:${active.sessionId}`) ||
@@ -565,14 +670,19 @@ export default function (pi: ExtensionAPI): void {
       if (original.room != null) {
         const room = readRoom(active.paths, original.room);
         if (room == null) return fail(`Room ${original.room} no longer exists.`);
+        // One id for both the log line and the envelope, so a post in the history
+        // can be joined to the receipts it produced. Minting a second uuid for
+        // the envelope left receipts naming an id the history did not contain.
+        const id = randomUUID();
         const seq = appendPost(active.paths, room.name, {
+          id,
           from: active.name,
           text: body,
           sentAt: nowIso(),
           recipients: room.members.filter((m) => m !== active.name),
         });
         deliver(active.paths, {
-          id: randomUUID(),
+          id,
           from: active.name,
           to: room.members.filter((m) => m !== active.name),
           text: body,
@@ -651,12 +761,8 @@ export default function (pi: ExtensionAPI): void {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const active = join(ctx);
       const name = slugify(params.room);
-      const room = readRoom(active.paths, name);
+      const room = addRoomMember(active.paths, name, active.name);
       if (room == null) return fail(`Room ${name} does not exist.`);
-      if (!room.members.includes(active.name)) {
-        room.members = uniqueMembers([...room.members, active.name]);
-        saveRoom(active.paths, room);
-      }
       return text(`Joined room ${name} (${room.members.length} members): ${room.members.join(", ")}.`, { room });
     },
   });
@@ -682,14 +788,18 @@ export default function (pi: ExtensionAPI): void {
       if (over != null) return fail(over);
       const body = sanitize(params.message);
       const recipients = room.members.filter((m) => m !== active.name);
+      // One id for the log line and the envelope: `receipts/<id>.json` then names
+      // a post that is actually in the history, instead of a uuid nothing records.
+      const id = randomUUID();
       const seq = appendPost(active.paths, name, {
+        id,
         from: active.name,
         text: body,
         sentAt: nowIso(),
         recipients,
       });
       deliver(active.paths, {
-        id: randomUUID(),
+        id,
         from: active.name,
         to: recipients,
         text: body,

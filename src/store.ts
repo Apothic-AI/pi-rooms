@@ -11,6 +11,15 @@
  *   inbox/<name>/read/*.json      delivered messages, kept for reply_all lookup
  *   rooms/<room>/room.json        room metadata: members, creator
  *   rooms/<room>/log.jsonl        append-only room history, one post per line
+ *   participants/<name>.json      a human identity: no pid, no process
+ *   presence/<name>.json          a human's declared presence, expired on read
+ *
+ * The last two are new directories that no older build reads. A human lives in
+ * `participants/` and never in `registry/`, because `listAgents` unlinks every
+ * registration whose process it cannot find — an unrelated lane reading the
+ * roster would delete a person's identity. Presence for a human is a lease
+ * derived at read time, never a pid probed with `kill(pid, 0)`: there is no
+ * process to find, and claiming one would be a lie the whole design avoids.
  *
  * Liveness is a pid *plus* the identity of the process behind it. A bare pid is
  * not enough: after a reboot the same number is handed to an unrelated process,
@@ -80,20 +89,38 @@ export interface Delivery {
   roomSeq?: number;
   /** Message id this one answers, when produced by reply_all. */
   replyTo?: string;
+  /**
+   * How the envelope was written: `cli`, `tui` or `agent`.
+   *
+   * Self-declared, exactly as on {@link RoomPost} — see the note there. It is
+   * additive and optional, so a lane running older code neither writes it nor
+   * needs it.
+   */
+  via?: string;
+  /** Which client wrote it. Self-declared, like `via`. */
+  client?: string;
 }
 
 /**
- * What the extension can honestly observe about one message.
+ * What can honestly be said about one message.
  *
  * `queued` means a file exists in the recipient's inbox; `delivered` means the
- * recipient's own session was handed it through `pi.sendMessage`. There is
- * deliberately no `read` state: the extension cannot see what a model does with
- * a message once its session has it, and a receipt that claimed otherwise would
- * be worse than none.
+ * recipient's own session was handed it through `pi.sendMessage`. The extension
+ * writes only those two: it cannot see what a model does with a message once
+ * its session has it, and a receipt that claimed otherwise would be worse than
+ * none.
+ *
+ * `readAt` is written by a *client*, not by the extension. A client is the
+ * renderer, so it can attest exactly when the bytes became visible on a screen;
+ * that is a different holder class making a claim about a different fact, not
+ * the extension inventing knowledge. It is additive and optional, so a lane
+ * running older code never writes it and never needs it.
  */
 export interface Receipt {
   queuedAt: string;
   deliveredAt?: string;
+  /** When a client rendered the message to a human. First read wins. */
+  readAt?: string;
 }
 
 export interface Room {
@@ -111,6 +138,17 @@ export interface RoomPost {
   sentAt: string;
   /** Members the post was fanned out to (everyone else in the room). */
   recipients: string[];
+  /**
+   * How the post was written: `cli`, `tui` or `agent`.
+   *
+   * Self-declared and never validated — `from`, `via` and `client` are all
+   * claims by the writer, so provenance is a signal a reader uses and never a
+   * control the system enforces. A reader that treats `via: "cli"` as
+   * authenticated is worse off than one shown no marker at all.
+   */
+  via?: string;
+  /** Which client wrote it, for a reader that wants to tell two writers apart. */
+  client?: string;
 }
 
 export interface Paths {
@@ -119,6 +157,10 @@ export interface Paths {
   inbox: string;
   rooms: string;
   receipts: string;
+  /** Human identity records. Never pruned, never probed for a pid. */
+  participants: string;
+  /** Human presence leases, written by a client and expired on read. */
+  presence: string;
 }
 
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
@@ -139,6 +181,8 @@ export function resolvePaths(base: string): Paths {
     inbox: path.join(base, "inbox"),
     rooms: path.join(base, "rooms"),
     receipts: path.join(base, "receipts"),
+    participants: path.join(base, "participants"),
+    presence: path.join(base, "presence"),
   };
 }
 
@@ -176,11 +220,45 @@ export function slugify(value: string): string {
   return slug.length > 0 ? slug : "agent";
 }
 
-/** Replace control characters so a message cannot drive the receiving terminal. */
+/**
+ * Replace control characters so a message cannot drive the receiving terminal.
+ *
+ * Split out from {@link sanitize} so a writer can tell whether the *length* cap
+ * fired. A client has to warn its human before the send is recorded as
+ * successful, and it cannot do that by comparing lengths after `sanitize` has
+ * already added the marker.
+ */
+export function cleanMessage(text: string): string {
+  return text.replace(/\r\n/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
+}
+
+/** The marker every capped message ends with, so a reader sees the cut itself. */
+export const TRUNCATION_MARKER_RE = /\n… \[truncated (\d+) chars\]$/;
+
+/**
+ * Apply the {@link MAX_MESSAGE_CHARS} cap, marking the cut rather than hiding it.
+ *
+ * Idempotent: a message this function already capped is returned untouched. That
+ * matters because both the writer and `appendPost` apply it, and a second pass
+ * over an already-capped message would slice into the marker and drop the first
+ * pass's tail — a silent cut, which is the one behaviour the marker exists to
+ * rule out.
+ *
+ * The idempotence test compares length *excluding* the marker against the cap
+ * rather than trusting the marker's presence: a long message that happens to end
+ * in those words is not a capped message, and leaving it uncapped because it
+ * looks like one would be the same silent bypass in a different costume.
+ */
+export function enforceMessageCap(text: string): string {
+  if (text.length <= MAX_MESSAGE_CHARS) return text;
+  const marker = TRUNCATION_MARKER_RE.exec(text);
+  if (marker != null && text.length - marker[0].length <= MAX_MESSAGE_CHARS) return text;
+  return `${text.slice(0, MAX_MESSAGE_CHARS)}\n… [truncated ${text.length - MAX_MESSAGE_CHARS} chars]`;
+}
+
+/** Replace control characters, then cap length so a message cannot flood a reader. */
 export function sanitize(text: string): string {
-  const cleaned = text.replace(/\r\n/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
-  if (cleaned.length <= MAX_MESSAGE_CHARS) return cleaned;
-  return `${cleaned.slice(0, MAX_MESSAGE_CHARS)}\n… [truncated ${cleaned.length - MAX_MESSAGE_CHARS} chars]`;
+  return enforceMessageCap(cleanMessage(text));
 }
 
 export function isAlive(pid: number): boolean {
@@ -279,8 +357,7 @@ function isDeadState(procId: string | null | undefined): boolean {
  */
 export function isRegistrationLive(reg: Registration): boolean {
   if (!isAlive(reg.pid)) return false;
-  const current = bootId();
-  if (reg.bootId != null && current != null && reg.bootId !== current) return false;
+  if (fromEarlierBoot(reg.bootId, bootId())) return false;
   const identity = procIdentity(reg.pid);
   if (identity != null && reg.procId != null) {
     // A dead state is checked first: a zombie keeps its starttime, so the
@@ -295,8 +372,7 @@ export function isRegistrationLive(reg: Registration): boolean {
 /** Why a registration is considered gone, for diagnostics. */
 export function livenessDiagnosis(reg: Registration): string | null {
   if (!isAlive(reg.pid)) return "no such process";
-  const current = bootId();
-  if (reg.bootId != null && current != null && reg.bootId !== current) return "registered in an earlier boot";
+  if (fromEarlierBoot(reg.bootId, bootId())) return "registered in an earlier boot";
   const identity = procIdentity(reg.pid);
   if (identity != null && reg.procId != null) {
     if (isDeadState(identity)) return "process is a zombie";
@@ -322,6 +398,191 @@ function readJson<T>(file: string): T | null {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Locking shared JSON
+// ---------------------------------------------------------------------------
+
+/**
+ * A lock older than this, held by a process that is gone, is abandoned.
+ *
+ * The unit is deliberately seconds-of-wall-clock, not milliseconds-of-work: the
+ * only fact that makes removal safe is that the holder cannot still be inside
+ * its critical section, and a dead pid plus a wide age margin is the cheapest
+ * honest evidence of that.
+ */
+const LOCK_STALE_MS = 10_000;
+
+/** Waits before giving up. Bounded on purpose — see {@link withFileLock}. */
+const LOCK_RETRIES = 5;
+
+/** Linear backoff between waits: 25, 50, 75, 100, 125ms. */
+const LOCK_BACKOFF_MS = 25;
+
+interface LockFile {
+  pid: number;
+  startedAt: string;
+  /**
+   * Boot the lock was taken under, when the platform names one.
+   *
+   * Optional because a writer running an older build does not stamp it; a lock
+   * without one falls back to the pid-and-age test below.
+   */
+  bootId?: string;
+}
+
+/**
+ * Sleep without a timer, so this stays usable from a synchronous write path.
+ *
+ * `Atomics.wait` on a value nobody ever notifies is the only portable way to
+ * block the current thread for a fixed time in Node without an event loop turn.
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Whether a recorded boot is not the one we are running in.
+ *
+ * One definition, used by registrations and by locks, so "this is from an
+ * earlier boot" means the same thing everywhere. False when either side is
+ * unknown: without two boot ids there is nothing to compare, and guessing would
+ * be the caller's bug to pay for, not ours to hide.
+ */
+function fromEarlierBoot(recorded: string | null | undefined, current: string | null): boolean {
+  return recorded != null && current != null && recorded !== current;
+}
+
+/**
+ * Whether a lock file has been abandoned by a holder that is gone.
+ *
+ * Reuses {@link isAlive}, the same liveness test presence uses, so there is one
+ * definition of "this process exists" in the module, and the same boot-id test
+ * presence uses, for the same reason: a bare pid is not enough after a reboot.
+ *
+ * The order matters. A lock stamped with a *different* boot cannot still be
+ * inside its critical section — no process survives a reboot — so it is
+ * abandoned no matter how alive its pid looks now; that pid was handed to
+ * somebody unrelated, and treating it as a holder wedges the file permanently,
+ * because the wait budget never expires a lock it believes is held. Only then
+ * does the pid test run, and only for a lock from this boot (or one carrying no
+ * boot id at all, as an older writer's does).
+ *
+ * When {@link bootId} is unreadable we cannot compare boots, and the choice is
+ * between two wrong answers. We fall through to the pid-and-age test rather than
+ * declaring the lock foreign: an unreadable boot id is not evidence that the
+ * holder died, and assuming it did would put two live writers inside the same
+ * read-modify-write — the silent lost update this lock exists to prevent. A
+ * wedge is loud, names the file, and the caller can remove it; a lost update is
+ * silent and permanent. So the unreadable case degrades to exactly the behaviour
+ * before this guard, which is the honest floor.
+ */
+function lockIsAbandoned(lockPath: string): boolean {
+  const held = readJson<LockFile>(lockPath);
+  if (held != null && fromEarlierBoot(held.bootId, bootId())) return true;
+  if (held != null && isAlive(held.pid)) return false;
+  // Age comes from the holder's own stamp when it is readable, and from the file
+  // otherwise: a writer killed between `open` and `write` leaves an empty lock,
+  // which must not be able to wedge the path forever either.
+  let age: number;
+  const started = held == null ? Number.NaN : Date.parse(held.startedAt);
+  if (Number.isFinite(started)) {
+    age = Date.now() - started;
+  } else {
+    try {
+      age = Date.now() - fs.statSync(lockPath).mtimeMs;
+    } catch {
+      // Vanished between the failed open and this stat: let the next attempt
+      // take it, nobody holds it now.
+      return true;
+    }
+  }
+  return age > LOCK_STALE_MS;
+}
+
+/**
+ * Run `fn` holding an exclusive lock on `<file>.lock`.
+ *
+ * `temp + rename` is atomic but not exclusive: two writers each read, each
+ * write and the last rename wins, so one writer's update disappears without an
+ * error anywhere. This holds a lock file across the read-modify-write, which is
+ * the part `writeJsonAtomic` cannot do.
+ *
+ * The wait is bounded — a handful of short sleeps and then a thrown error
+ * naming the lock path. An unbounded wait would be worse than a failed write:
+ * it hangs the caller silently on every subsequent call, whereas a throw is
+ * loud and names the file to remove.
+ *
+ * A lock left by a process that died is removed once and the acquisition retried
+ * immediately, so a kill -9 mid-write costs the next writer nothing.
+ */
+export function withFileLock<T>(file: string, fn: () => T): T {
+  const lockPath = `${file}.lock`;
+  ensureDir(path.dirname(lockPath));
+  const startedAt = new Date().toISOString();
+  let staleRemovals = 0;
+  let waits = 0;
+
+  for (;;) {
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(lockPath, "wx", 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    if (fd != null) {
+      try {
+        // The boot is stamped alongside the pid so a lock that outlives a reboot
+        // is recognisable as such: the pid it names belongs to somebody else now.
+        const boot = bootId();
+        const body: LockFile =
+          boot == null ? { pid: process.pid, startedAt } : { pid: process.pid, startedAt, bootId: boot };
+        fs.writeFileSync(fd, `${JSON.stringify(body, null, 2)}\n`);
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
+    }
+    // Exactly one attempt to clear an abandoned lock, and it does not consume
+    // the wait budget: the holder it replaces is already dead.
+    if (staleRemovals === 0 && lockIsAbandoned(lockPath)) {
+      staleRemovals += 1;
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        /* another writer cleared it first, or it was released normally */
+      }
+      continue;
+    }
+    waits += 1;
+    if (waits > LOCK_RETRIES) {
+      throw new Error(
+        `Could not lock ${lockPath}: another process holds it. ` +
+          `Waited ${LOCK_RETRIES} times. If the holder is gone, remove that file and retry.`,
+      );
+    }
+    sleepSync(waits * LOCK_BACKOFF_MS);
+  }
+
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      /* released by a stale-lock recovery; the write it guarded still happened */
+    }
+  }
+}
+
+/** Drop undefined entries, so a patch can never write `key: undefined` over a stamp. */
+function definedOnly<T extends object>(patch: T): Partial<T> {
+  const out: Partial<T> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) (out as Record<string, unknown>)[key] = value;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,20 +667,49 @@ export function listAgents(paths: Paths): Registration[] {
  * A name already held by another live process is never taken over; the caller
  * gets a suffixed variant instead. Two agents silently sharing one name would
  * merge two inboxes into one, which is the failure this prevents.
+ *
+ * A **human participant's name is reserved even when no process holds it**, and
+ * that is the whole point of doing this here rather than in a client. For a
+ * human `readRegistration` returns null, so without this check the first
+ * condition below would grant the name unsuffixed, silently, to whichever lane
+ * derived or pinned it — including a lane that merely started in the wrong tab.
+ * Any room member may DM the human, so that collision is the difference between
+ * a person's mailbox and a lane's. The reservation lives here because this is
+ * the only place a name is granted.
  */
 export function claimName(paths: Paths, desired: string, pid: number): string {
   const base = isValidName(desired) ? desired : slugify(desired);
   let candidate = base;
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    const existing = readRegistration(paths, candidate);
-    if (existing == null || !isRegistrationLive(existing) || existing.pid === pid) return candidate;
+    // Checked before the registration test: a reserved name has no live
+    // registration to collide with, which is exactly why it needs a rule.
+    if (!isReservedName(paths, candidate)) {
+      const existing = readRegistration(paths, candidate);
+      if (existing == null || !isRegistrationLive(existing) || existing.pid === pid) return candidate;
+    }
+    // The suffixing is the loop's own, unchanged: an attempt-0 miss yields
+    // `<base>-<pid>` and every later attempt adds a counter. No new scheme.
     candidate = `${base.slice(0, 44)}-${pid}`;
     if (attempt > 0) candidate = `${base.slice(0, 40)}-${pid}-${attempt}`;
   }
   return `${base.slice(0, 40)}-${pid}-${randomUUID().slice(0, 4)}`;
 }
 
+/**
+ * Write a registration.
+ *
+ * Refuses a reserved participant name outright instead of renaming: `claimName`
+ * is the renamer, and a caller that reached this point with a human's name has a
+ * bug rather than a preference. Renaming silently here would hide that bug and
+ * leave the caller believing it owns a name it does not.
+ */
 export function register(paths: Paths, entry: Registration): void {
+  if (isReservedName(paths, entry.name)) {
+    throw new Error(
+      `Refusing to register ${entry.name}: the name is reserved by a human participant in ` +
+        `${paths.participants}. Claim a different name with claimName instead.`,
+    );
+  }
   writeJsonAtomic(path.join(paths.registry, `${entry.name}.json`), entry);
 }
 
@@ -429,6 +719,321 @@ export function unregister(paths: Paths, name: string): void {
   } catch {
     /* already gone */
   }
+}
+
+// ---------------------------------------------------------------------------
+// Human participants
+// ---------------------------------------------------------------------------
+
+/**
+ * A human's identity record, from `participants/<name>.json`.
+ *
+ * This is not a {@link Registration}: there is no pid, no cwd, no process. A
+ * human is a principal with a mailbox, and the only code paths that could treat
+ * them as a process are the ones that read `registry/`.
+ *
+ * `kind` is a string and not a closed enum. v1 writes `"human"`; a reader that
+ * rejected an unknown kind would make this file a compatibility hazard for
+ * every later kind of participant, and nothing here needs to branch on it.
+ */
+export interface Participant {
+  name: string;
+  kind: string;
+  /** Arbitrary text shown next to the name. Never a key, never in a path. */
+  displayName?: string | null;
+  createdBy: string;
+  createdAt: string;
+  client?: {
+    id: string;
+    label: string;
+    /** sha256 of the client token. A lock against two clients interleaving, not a credential. */
+    tokenSha256?: string;
+  };
+}
+
+export interface ParticipantClient {
+  id: string;
+  label: string;
+  tokenSha256?: string;
+}
+
+export interface NewParticipant {
+  name: string;
+  kind?: string;
+  displayName?: string | null;
+  createdBy: string;
+  client?: ParticipantClient;
+  /** Fixed creation stamp, for tests. Defaults to now. */
+  createdAt?: string;
+}
+
+function participantPath(paths: Paths, name: string): string {
+  return path.join(paths.participants, `${name}.json`);
+}
+
+/**
+ * One participant record, or null when there is none or it cannot be read.
+ *
+ * `displayName` never reaches this path: the file name comes from `name` alone,
+ * so a display name containing `/`, a space or anything else is harmless. A
+ * record whose stored `name` disagrees with the file it was found in is treated
+ * as absent, because the file name is the reservation key and a mismatch means
+ * the record does not describe the name it is reserving.
+ */
+export function readParticipant(paths: Paths, name: string): Participant | null {
+  if (!isValidName(name)) return null;
+  const record = readJson<Participant>(participantPath(paths, name));
+  if (record == null || typeof record !== "object") return null;
+  if (typeof record.name !== "string" || record.name !== name) return null;
+  if (typeof record.kind !== "string" || record.kind.length === 0) return null;
+  return record;
+}
+
+/**
+ * Every participant record that parses.
+ *
+ * Read-only: unlike {@link listAgents} this never unlinks anything. A corrupt
+ * record is skipped rather than deleted, because deleting a human's identity is
+ * the one failure this design exists to prevent.
+ */
+export function listParticipants(paths: Paths): Participant[] {
+  let files: string[];
+  try {
+    files = fs.readdirSync(paths.participants).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const out: Participant[] = [];
+  for (const file of files) {
+    const name = file.slice(0, -".json".length);
+    const record = readParticipant(paths, name);
+    if (record != null) out.push(record);
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Whether a name belongs to a human participant.
+ *
+ * True iff a readable participant record exists. An unreadable file is *not* a
+ * reservation: a record nobody can parse cannot be honoured by `register`
+ * either, and treating it as one would wedge the name with no way to see why.
+ */
+export function isReservedName(paths: Paths, name: string): boolean {
+  return readParticipant(paths, name) != null;
+}
+
+/**
+ * Write a participant record.
+ *
+ * Rejects a `name` that is not `NAME_RE`-valid. That is load-bearing rather than
+ * cosmetic: `uniqueMembers` drops any member failing `isValidName` on the
+ * `room.json` rewrite path, so a human whose name did not validate would be
+ * silently ejected from every room by the next lane that joined one.
+ */
+export function saveParticipant(paths: Paths, participant: Participant): Participant {
+  if (!isValidName(participant.name)) {
+    throw new Error(
+      `Participant name ${JSON.stringify(participant.name)} is not a valid rooms name: ` +
+        `lowercase letters, digits, dash or underscore, up to 48 characters. ` +
+        `A display name goes in displayName, which is never used as a path.`,
+    );
+  }
+  if (typeof participant.kind !== "string" || participant.kind.length === 0) {
+    throw new Error(`Participant ${participant.name} needs a non-empty kind (v1 writes "human").`);
+  }
+  writeJsonAtomic(participantPath(paths, participant.name), participant);
+  return participant;
+}
+
+/**
+ * Create a participant record, defaulting to a human.
+ *
+ * The extension-side entry point. Deliberately not a `rooms_*` tool: exposing it
+ * to a model turn would let any lane invent a principal, and the tool surface is
+ * a separate decision from the storage primitive.
+ */
+export function createParticipant(paths: Paths, spec: NewParticipant): Participant {
+  const existing = readParticipant(paths, spec.name);
+  if (existing != null) return existing;
+  return saveParticipant(paths, {
+    name: spec.name,
+    kind: spec.kind ?? "human",
+    displayName: spec.displayName ?? null,
+    createdBy: spec.createdBy,
+    createdAt: spec.createdAt ?? new Date().toISOString(),
+    client: spec.client,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Presence
+// ---------------------------------------------------------------------------
+
+/** The states a presence record may declare. */
+export type PresenceState = "online" | "away" | "offline" | "unknown";
+
+/**
+ * How long after a lease expires a human still reads as `away` rather than
+ * `offline`.
+ *
+ * A client sends a heartbeat every 20s with a 60s lease, so a lease that has
+ * expired means only that *this minute's* heartbeat was missed — a laptop lid, a
+ * wifi blip, a client restart. Thirty minutes is the plan's own unit of \"a
+ * human stepping out\": §2.4 and §3.4 both render a stale lease as
+ * `away (23m)`, which is only true if the window is longer than 23 minutes. A
+ * shorter window would make the plan's own example read `offline`, and a longer
+ * one would let a client that has been gone all day still claim `away`.
+ */
+export const PRESENCE_GRACE_MS = 30 * 60 * 1000;
+
+/**
+ * A presence record, as written by a client.
+ *
+ * No pid, no proc identity, no liveness stamp. A human has no process, so there
+ * is nothing here to probe, and `isRegistrationLive` is never applied to one.
+ */
+export interface Presence {
+  name: string;
+  /** What the client declared. `offline`/`unknown` are never stored by v1 clients. */
+  state: PresenceState;
+  lastSeenAt: string;
+  leaseUntil: string;
+  client?: string;
+  note?: string | null;
+}
+
+/** A presence record plus everything derived from it at read time. */
+export interface PresenceView {
+  name: string;
+  /** Effective state: declared `away` honoured, everything else derived from the lease. */
+  state: PresenceState;
+  /** What the record declared, for a reader that wants to distinguish derived from written. */
+  declared: PresenceState;
+  lastSeenAt: string | null;
+  leaseUntil: string | null;
+  client?: string;
+  note?: string | null;
+  /** Milliseconds since the last heartbeat, or null when there is no record. */
+  ageMs: number | null;
+  /** True when the record exists and parses but derives to nothing better than unknown. */
+  present: boolean;
+}
+
+const PRESENCE_STATES: readonly PresenceState[] = ["online", "away", "offline", "unknown"];
+
+function isPresenceState(value: unknown): value is PresenceState {
+  return typeof value === "string" && (PRESENCE_STATES as readonly string[]).includes(value);
+}
+
+function parseInstant(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const stamp = Date.parse(value);
+  return Number.isFinite(stamp) ? stamp : null;
+}
+
+/**
+ * Write a presence lease. The writer is a client; the only writer is a human's own
+ * client, and no `rooms_*` tool reaches this function.
+ *
+ * The record is stored as declared. Expiry is not applied here: a stored
+ * `offline` would be a decision frozen at write time, while the same file read
+ * later must answer differently. That is why every derived state is computed in
+ * {@link readPresence} instead.
+ */
+export function writePresence(paths: Paths, presence: Presence): Presence {
+  if (!isValidName(presence.name)) {
+    throw new Error(`Presence name ${JSON.stringify(presence.name)} is not a valid rooms name.`);
+  }
+  if (!isPresenceState(presence.state)) {
+    throw new Error(`Presence state must be online, away, offline or unknown.`);
+  }
+  writeJsonAtomic(path.join(paths.presence, `${presence.name}.json`), presence);
+  return presence;
+}
+
+/**
+ * Presence for one name, with the effective state derived from the clock.
+ *
+ * Pure with respect to the store: it never writes, never prunes and never
+ * probes. Calling it twice with the same `now` gives the same answer, which is
+ * what makes it safe to call from a tool that any lane may run.
+ *
+ * The derivation, in order:
+ *
+ * 1. no readable record → `unknown`. Absence is not evidence a person is gone;
+ *    there is simply nothing declared.
+ * 2. an explicitly declared `away` (or `offline`) → that word, whatever the
+ *    lease says. A person who said they stepped out is not overruled by a timer.
+ * 3. lease in the future → `online`.
+ * 4. lease expired but the last evidence within {@link PRESENCE_GRACE_MS} →
+ *    `away`.
+ * 5. otherwise → `offline`, but only where there *is* a timestamp to be stale.
+ *    A record carrying no usable instant at all is `unknown`, for the same
+ *    reason a missing file is: `offline` is a claim about a person, and there is
+ *    nothing here to support it.
+ */
+export function readPresence(paths: Paths, name: string, now: number = Date.now()): PresenceView {
+  const absent: PresenceView = {
+    name,
+    state: "unknown",
+    declared: "unknown",
+    lastSeenAt: null,
+    leaseUntil: null,
+    ageMs: null,
+    present: false,
+  };
+  if (!isValidName(name)) return absent;
+  const record = readJson<Presence>(path.join(paths.presence, `${name}.json`));
+  if (record == null || typeof record !== "object") return absent;
+  const declared = isPresenceState(record.state) ? record.state : "unknown";
+  const leaseUntil = parseInstant(record.leaseUntil);
+  const lastSeenAt = parseInstant(record.lastSeenAt);
+  const ageMs = lastSeenAt == null ? null : Math.max(0, now - lastSeenAt);
+  const freshLease = leaseUntil != null && leaseUntil > now;
+  // The instant the grace window is measured from. `lastSeenAt` is the honest
+  // answer; when a record only carries a lease, the lease is the last thing it
+  // said about the human, so it stands in rather than leaving the window
+  // undefined.
+  const evidence = lastSeenAt ?? leaseUntil;
+
+  let state: PresenceState;
+  if (declared === "away" || declared === "offline") {
+    // A declaration always wins over a timer. Only a client writes either word,
+    // so honouring the lease instead would let a stale heartbeat overrule a
+    // person who said they had left.
+    state = declared;
+  } else if (declared === "unknown") {
+    // A client that explicitly declared nothing declared nothing; the word is
+    // not a licence to infer a state from the clock.
+    state = "unknown";
+  } else if (freshLease) state = "online";
+  else if (evidence == null) state = "unknown";
+  else if (now - evidence <= PRESENCE_GRACE_MS) state = "away";
+  else state = "offline";
+
+  return {
+    name,
+    state,
+    declared,
+    lastSeenAt: typeof record.lastSeenAt === "string" ? record.lastSeenAt : null,
+    leaseUntil: typeof record.leaseUntil === "string" ? record.leaseUntil : null,
+    client: typeof record.client === "string" ? record.client : undefined,
+    note: typeof record.note === "string" ? record.note : null,
+    ageMs,
+    present: true,
+  };
+}
+
+/** Every participant with its derived presence, sorted by name. */
+export function listPresence(
+  paths: Paths,
+  now: number = Date.now(),
+): Array<{ participant: Participant; presence: PresenceView }> {
+  return listParticipants(paths).map((participant) => ({
+    participant,
+    presence: readPresence(paths, participant.name, now),
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -476,19 +1081,32 @@ export function receiptPathFor(paths: Paths, id: string): string {
   return receiptPath(paths, id);
 }
 
+/**
+ * Merge one patch into one recipient's receipt, under a lock.
+ *
+ * The entry is *spread*, not reconstructed. Reconstructing erased every field
+ * the writing code did not know about, which is how two receipts on this machine
+ * came to record a delivery that archived but whose `deliveredAt` never
+ * persisted — a sender reads that as a message that never arrived. A spread
+ * keeps unknown fields from any version, including one newer than the writer.
+ *
+ * A known stamp is never replaced once set: `current.x ?? patch.x` is the "never
+ * move a timestamp backwards" rule, and it is also what makes a repeated call
+ * not new information. A patch therefore adds, and cannot blank.
+ */
 function recordReceipt(paths: Paths, id: string, recipient: string, patch: Partial<Receipt>): void {
   const file = receiptPath(paths, id);
-  const existing = readJson<{ id: string; receipts: Record<string, Receipt> }>(file) ?? {
-    id,
-    receipts: {},
-  };
-  const current = existing.receipts[recipient] ?? ({} as Receipt);
-  // Never move a timestamp backwards: a repeated call is not new information.
-  existing.receipts[recipient] = {
-    queuedAt: current.queuedAt ?? patch.queuedAt ?? new Date().toISOString(),
-    deliveredAt: current.deliveredAt ?? patch.deliveredAt,
-  };
-  writeJsonAtomic(file, existing);
+  withFileLock(file, () => {
+    const existing = readJson<ReceiptRecord>(file) ?? { id, receipts: {} };
+    if (existing.receipts == null) existing.receipts = {};
+    const current = existing.receipts[recipient] ?? ({} as Receipt);
+    const merged = { ...current, ...definedOnly(patch) } as Receipt;
+    merged.queuedAt = current.queuedAt ?? patch.queuedAt ?? new Date().toISOString();
+    if (current.deliveredAt != null) merged.deliveredAt = current.deliveredAt;
+    if (current.readAt != null) merged.readAt = current.readAt;
+    existing.receipts[recipient] = merged;
+    writeJsonAtomic(file, existing);
+  });
 }
 
 /** What the extension observed for one message, or null when it never saw it. */
@@ -510,6 +1128,19 @@ export function readReceipts(paths: Paths, id: string): ReceiptRecord | null {
  */
 export function markDelivered(paths: Paths, id: string, recipient: string): void {
   recordReceipt(paths, id, recipient, { deliveredAt: new Date().toISOString() });
+}
+
+/**
+ * Record that a client rendered a message to a human.
+ *
+ * Only a renderer can attest this, which is why the extension does not write it:
+ * `readAt` means "a screen showed these bytes", never "acted on" or "agreed
+ * with". It goes through {@link recordReceipt}, so it inherits the spread and the
+ * lock, and the first read wins: reading the same message twice is not new
+ * information, and a second read must not reorder delivery evidence.
+ */
+export function markRead(paths: Paths, id: string, recipient: string, at?: string): void {
+  recordReceipt(paths, id, recipient, { readAt: at ?? new Date().toISOString() });
 }
 
 /** Undelivered messages for one agent, oldest first. */
@@ -630,7 +1261,31 @@ export function readRoom(paths: Paths, room: string): Room | null {
 }
 
 export function saveRoom(paths: Paths, room: Room): void {
-  writeJsonAtomic(path.join(roomDir(paths, room.name), "room.json"), room);
+  const file = path.join(roomDir(paths, room.name), "room.json");
+  withFileLock(file, () => writeJsonAtomic(file, room));
+}
+
+/**
+ * Add one member to a room, reading and writing under the room's lock.
+ *
+ * Joining is a read-modify-write of a shared file: two lanes joining at once
+ * each read the old member list, each write their own, and one loses. The lock
+ * spans the read for that reason — locking only the write would still let the
+ * loser's member list win. Returns the room as it stands afterwards, or null when
+ * the room does not exist.
+ */
+export function addRoomMember(paths: Paths, name: string, member: string): Room | null {
+  if (!isValidRoom(name)) return null;
+  const file = path.join(roomDir(paths, name), "room.json");
+  return withFileLock(file, () => {
+    const room = readJson<Room>(file);
+    if (room == null) return null;
+    if (!room.members.includes(member)) {
+      room.members = uniqueMembers([...room.members, member]);
+      writeJsonAtomic(file, room);
+    }
+    return room;
+  });
 }
 
 export function listRooms(paths: Paths): Room[] {
@@ -669,12 +1324,23 @@ export function roomSeq(paths: Paths, room: string): number {
  * The log carries no sequence number: position in the file *is* the order, so
  * concurrent appenders cannot disagree about what came next. A single small
  * append per post is atomic on the platforms this runs on.
+ *
+ * The returned number is read *before* the append — a TOCTOU. It is safe for
+ * display and for correlating an envelope, and it is not safe to stamp into the
+ * post: the authoritative number is assigned when the log is read. There is no
+ * `seq` field on a post for exactly that reason.
+ *
+ * The length cap is enforced here as well as by the writers. It used to live
+ * only in the tool handlers, which made it a convention of one caller rather
+ * than a property of the store: anything that appended directly bypassed it and
+ * every reader then rendered an unbounded post.
  */
 export function appendPost(paths: Paths, room: string, post: RoomPost): number {
   const file = logPath(paths, room);
   ensureDir(path.dirname(file));
   const seq = roomSeq(paths, room) + 1;
-  fs.appendFileSync(file, `${JSON.stringify(post)}\n`, { mode: 0o600 });
+  const capped: RoomPost = { ...post, text: enforceMessageCap(post.text) };
+  fs.appendFileSync(file, `${JSON.stringify(capped)}\n`, { mode: 0o600 });
   return seq;
 }
 
