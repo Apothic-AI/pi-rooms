@@ -42,9 +42,13 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.ts plugin/test/*.test.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts plugin/test/*.test.ts web/test/*.test.ts",
+    "test:unit": "node --experimental-strip-types --test test/*.test.ts",
     "test:plugin": "node --experimental-strip-types --test plugin/test/*.test.ts",
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p .",
+    "web": "node --experimental-strip-types --no-warnings web/server/server.ts",
+    "web:screenshot": "node --experimental-strip-types --no-warnings web/tools/screenshot.ts",
+    "web:demo": "node --experimental-strip-types --no-warnings web/tools/demo-store.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

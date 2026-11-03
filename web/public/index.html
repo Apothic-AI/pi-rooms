@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rooms — read-only reader</title>
+    <!--
+      A favicon that is inline data, so the page makes exactly three requests
+      (html, css, js) and a 404 for an icon never appears in a console in a
+      screenshot or a test.
+    -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23f4efe5'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%23a3451c' stroke-width='2'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/app.css" />
+    <meta name="color-scheme" content="light dark" />
+  </head>
+  <body>
+    <div id="app">
+      <!--
+        The shell before the module boots. Deliberately not a spinner: if the
+        module fails to load at all, this is what the operator sees, so it has to
+        be a legible state rather than a blank pane — the same rule criterion 5
+        applies to the message list.
+      -->
+      <div class="state" aria-busy="true">
+        <p class="state__kicker">loading</p>
+        <h2 class="state__title">Starting the reader…</h2>
+        <p class="state__body">
+          If this never changes, the module did not run. Open the browser console, or check the
+          terminal this server was started from — it prints the store it is reading.
+        </p>
+      </div>
+    </div>
+    <noscript>
+      <div class="state">
+        <p class="state__kicker">no javascript</p>
+        <h2 class="state__title">This reader needs JavaScript.</h2>
+        <p class="state__body">
+          It is a SolidJS client over a loopback SSE relay. Read the same store in a terminal with
+          <code>bin/rooms read --room R</code> or <code>bin/rooms --help</code>.
+        </p>
+      </div>
+    </noscript>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
