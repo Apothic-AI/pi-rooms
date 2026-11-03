@@ -89,6 +89,16 @@ export interface Delivery {
   roomSeq?: number;
   /** Message id this one answers, when produced by reply_all. */
   replyTo?: string;
+  /**
+   * How the envelope was written: `cli`, `tui` or `agent`.
+   *
+   * Self-declared, exactly as on {@link RoomPost} — see the note there. It is
+   * additive and optional, so a lane running older code neither writes it nor
+   * needs it.
+   */
+  via?: string;
+  /** Which client wrote it. Self-declared, like `via`. */
+  client?: string;
 }
 
 /**
@@ -128,6 +138,17 @@ export interface RoomPost {
   sentAt: string;
   /** Members the post was fanned out to (everyone else in the room). */
   recipients: string[];
+  /**
+   * How the post was written: `cli`, `tui` or `agent`.
+   *
+   * Self-declared and never validated — `from`, `via` and `client` are all
+   * claims by the writer, so provenance is a signal a reader uses and never a
+   * control the system enforces. A reader that treats `via: "cli"` as
+   * authenticated is worse off than one shown no marker at all.
+   */
+  via?: string;
+  /** Which client wrote it, for a reader that wants to tell two writers apart. */
+  client?: string;
 }
 
 export interface Paths {
@@ -199,11 +220,45 @@ export function slugify(value: string): string {
   return slug.length > 0 ? slug : "agent";
 }
 
-/** Replace control characters so a message cannot drive the receiving terminal. */
+/**
+ * Replace control characters so a message cannot drive the receiving terminal.
+ *
+ * Split out from {@link sanitize} so a writer can tell whether the *length* cap
+ * fired. A client has to warn its human before the send is recorded as
+ * successful, and it cannot do that by comparing lengths after `sanitize` has
+ * already added the marker.
+ */
+export function cleanMessage(text: string): string {
+  return text.replace(/\r\n/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
+}
+
+/** The marker every capped message ends with, so a reader sees the cut itself. */
+export const TRUNCATION_MARKER_RE = /\n… \[truncated (\d+) chars\]$/;
+
+/**
+ * Apply the {@link MAX_MESSAGE_CHARS} cap, marking the cut rather than hiding it.
+ *
+ * Idempotent: a message this function already capped is returned untouched. That
+ * matters because both the writer and `appendPost` apply it, and a second pass
+ * over an already-capped message would slice into the marker and drop the first
+ * pass's tail — a silent cut, which is the one behaviour the marker exists to
+ * rule out.
+ *
+ * The idempotence test compares length *excluding* the marker against the cap
+ * rather than trusting the marker's presence: a long message that happens to end
+ * in those words is not a capped message, and leaving it uncapped because it
+ * looks like one would be the same silent bypass in a different costume.
+ */
+export function enforceMessageCap(text: string): string {
+  if (text.length <= MAX_MESSAGE_CHARS) return text;
+  const marker = TRUNCATION_MARKER_RE.exec(text);
+  if (marker != null && text.length - marker[0].length <= MAX_MESSAGE_CHARS) return text;
+  return `${text.slice(0, MAX_MESSAGE_CHARS)}\n… [truncated ${text.length - MAX_MESSAGE_CHARS} chars]`;
+}
+
+/** Replace control characters, then cap length so a message cannot flood a reader. */
 export function sanitize(text: string): string {
-  const cleaned = text.replace(/\r\n/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
-  if (cleaned.length <= MAX_MESSAGE_CHARS) return cleaned;
-  return `${cleaned.slice(0, MAX_MESSAGE_CHARS)}\n… [truncated ${cleaned.length - MAX_MESSAGE_CHARS} chars]`;
+  return enforceMessageCap(cleanMessage(text));
 }
 
 export function isAlive(pid: number): boolean {
@@ -1269,12 +1324,23 @@ export function roomSeq(paths: Paths, room: string): number {
  * The log carries no sequence number: position in the file *is* the order, so
  * concurrent appenders cannot disagree about what came next. A single small
  * append per post is atomic on the platforms this runs on.
+ *
+ * The returned number is read *before* the append — a TOCTOU. It is safe for
+ * display and for correlating an envelope, and it is not safe to stamp into the
+ * post: the authoritative number is assigned when the log is read. There is no
+ * `seq` field on a post for exactly that reason.
+ *
+ * The length cap is enforced here as well as by the writers. It used to live
+ * only in the tool handlers, which made it a convention of one caller rather
+ * than a property of the store: anything that appended directly bypassed it and
+ * every reader then rendered an unbounded post.
  */
 export function appendPost(paths: Paths, room: string, post: RoomPost): number {
   const file = logPath(paths, room);
   ensureDir(path.dirname(file));
   const seq = roomSeq(paths, room) + 1;
-  fs.appendFileSync(file, `${JSON.stringify(post)}\n`, { mode: 0o600 });
+  const capped: RoomPost = { ...post, text: enforceMessageCap(post.text) };
+  fs.appendFileSync(file, `${JSON.stringify(capped)}\n`, { mode: 0o600 });
   return seq;
 }
 

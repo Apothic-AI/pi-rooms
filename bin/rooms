@@ -1,0 +1,967 @@
+#!/usr/bin/env node
+/**
+ * rooms — the writer a human uses.
+ *
+ * A human has no pi session, so it has no `pi.sendMessage`, no inbox worker and
+ * no way to run a `rooms_*` tool. Hand-writing `inbox/*.json` is a documented
+ * silent failure in both directions: a file that does not parse is *deleted*
+ * without an error, an envelope without a string `id` wedges a lane's inbox
+ * forever, and a log line whose last byte is not `\n` merges into the next post
+ * so that both vanish while still consuming a sequence number.
+ *
+ * So this is not a second implementation of the protocol. It is a thin CLI over
+ * the same `src/store.ts` functions the extension calls — atomic writes, the
+ * file lock, receipt transitions, positional numbering and truncation all stay
+ * in one place. `src/store.ts` imports only `node:*`, which is what makes that
+ * possible; if it ever grows a pi dependency, this file stops working and that
+ * is the signal to look, not to reimplement.
+ *
+ * What it deliberately does not do (§7 of the plan): no `create` verb, no
+ * `pins`, no `protocol.json`, no TUI, no config file, no daemon. Slice 1's
+ * client UI is `read --follow` in a pane, plain text.
+ *
+ * ---
+ *
+ * Provenance, stated where an implementer will read it: `from`, `via` and
+ * `client` are all **self-declared**. Nothing validates them and nothing can.
+ * Provenance is a signal a reader uses, never a control the system enforces. An
+ * agent that sees `via: "cli"` and treats it as authenticated is worse off than
+ * one shown no marker at all.
+ *
+ * The client token is a **lock, not a credential**. It exists so two clients
+ * cannot interleave cursors, drafts and presence under one name, the same job a
+ * pid suffix does for processes. It authenticates nobody: same-uid file access is
+ * the entire boundary.
+ */
+
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import * as path from "node:path";
+
+// Node strips TypeScript types without a flag from 22.18; earlier releases and
+// some 23.x builds need `--experimental-strip-types`. This file is plain JS so it
+// can run everywhere, and it re-execs itself once with the flag before importing
+// the store, which is `.ts` and is the whole point of importing it.
+if (process.features.typescript == null && process.env.PI_ROOMS_CLI_REEXEC !== "1") {
+  const child = spawn(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", process.argv[1], ...process.argv.slice(2)],
+    { stdio: "inherit", env: { ...process.env, PI_ROOMS_CLI_REEXEC: "1" } },
+  );
+  child.on("exit", (code, signal) => process.exit(signal != null ? 1 : (code ?? 1)));
+  child.on("error", () => process.exit(1));
+} else {
+  await main();
+}
+
+/**
+ * Everything below runs after the type-stripping guard. It is a function rather
+ * than top-level code so the `await import` of the store happens once, after the
+ * guard, instead of being hoisted above it.
+ */
+async function main() {
+  const store_ = await import("../src/store.ts");
+
+  /** How this writer identifies itself in `via`/`client`. Self-declared, like `from`. */
+  const CLIENT_LABEL = (process.env.PI_ROOMS_CLIENT_LABEL ?? "").trim() || "rooms-cli";
+  /** Presence lease: §2.4's 60s lease refreshed on a 20s heartbeat. */
+  const LEASE_MS = 60_000;
+  const HEARTBEAT_MS = 20_000;
+  /** `read --follow` poll interval. There is no event for "a file under $HOME changed". */
+  const POLL_MS = 500;
+  /** No limit, ever: `limit` keeps the newest N and would skip the start of a backlog. */
+  const NO_LIMIT = Number.MAX_SAFE_INTEGER;
+
+  const EXIT_USAGE = 2;
+
+  class CliError extends Error {
+    constructor(message, exitCode = 1) {
+      super(message);
+      this.exitCode = exitCode;
+    }
+  }
+
+  function fail(message, exitCode = 1) {
+    throw new CliError(message, exitCode);
+  }
+
+  // -------------------------------------------------------------------------
+  // Argument parsing
+  // -------------------------------------------------------------------------
+
+  const BOOLEAN_FLAGS = new Set(["json", "follow", "help", "version"]);
+
+  /**
+   * Parse `--flag value`, `--flag=value`, bare booleans and positionals.
+   *
+   * Written by hand rather than with `util.parseArgs` for one reason: `post` and
+   * `dm` take a free-form message as positionals, and that text may legitimately
+   * begin with a dash. Everything after `--` is text, and a dash-word that is not
+   * a flag this verb knows is treated as text too, so a human writing "— wait"
+   * does not get a usage error.
+   */
+  function parseArgs(argv, valueFlags) {
+    const flags = new Map();
+    const rest = [];
+    for (let i = 0; i < argv.length; i += 1) {
+      const arg = argv[i];
+      if (arg === "--") {
+        rest.push(...argv.slice(i + 1));
+        break;
+      }
+      if (!arg.startsWith("--") || arg.length <= 2) {
+        rest.push(arg);
+        continue;
+      }
+      const body = arg.slice(2);
+      const eq = body.indexOf("=");
+      const name = eq === -1 ? body : body.slice(0, eq);
+      const inline = eq === -1 ? null : body.slice(eq + 1);
+      if (BOOLEAN_FLAGS.has(name)) {
+        flags.set(name, inline == null ? true : inline !== "false");
+        continue;
+      }
+      if (!valueFlags.has(name)) {
+        rest.push(arg);
+        continue;
+      }
+      if (inline != null) {
+        flags.set(name, inline);
+        continue;
+      }
+      const value = argv[i + 1];
+      if (value == null) fail(`--${name} needs a value.`, EXIT_USAGE);
+      flags.set(name, value);
+      i += 1;
+    }
+    return { flags, rest };
+  }
+
+  // -------------------------------------------------------------------------
+  // Help
+  // -------------------------------------------------------------------------
+
+  const HELP = `rooms — read and write the pi-rooms store as a human
+
+usage:
+  rooms who                                   agents, plus a human participants section
+  rooms list                                  rooms with members and post counts
+  rooms read --room R [--since N] [--follow]  room history; --follow streams NDJSON
+  rooms read                                  your own inbox (drains it, stamps deliveredAt)
+  rooms post --room R TEXT...                 append a post, fan out to every other member
+  rooms dm --to NAME[,NAME] TEXT...           direct message
+  rooms ack --id ID                           stamp readAt on a message addressed to you
+  rooms join --room R                         add yourself to a room's members
+  rooms participants                          participant records
+  rooms presence                              presence records, state derived at read time
+
+identity:
+  --as NAME           who you are. Required by post, dm, ack and join.
+                      Read verbs accept it and use it to pick your inbox.
+  --token TOKEN       the client token for NAME, or set PI_ROOMS_CLIENT_TOKEN.
+                      Required whenever NAME has a participant record.
+
+  The client token is a lock, not a credential: it stops two clients from
+  interleaving cursors, drafts and presence under one name. It authenticates nobody;
+  same-uid file access is the whole boundary.
+
+provenance:
+  Posts and envelopes carry via: "cli" and client: "${CLIENT_LABEL}". These are
+  self-declared, exactly like from. Nothing validates them, so provenance is a
+  signal a reader uses, never a control the system enforces.
+
+environment:
+  PI_ROOMS_DIR            store root (default ~/.pi/agent/rooms)
+  PI_ROOMS_CLIENT_TOKEN   alternative to --token
+  PI_ROOMS_CLIENT_LABEL   overrides the client label above
+
+output:
+  --json   one JSON object on stdout, for a machine reader
+  --help   this text
+`;
+
+  // -------------------------------------------------------------------------
+  // Store helpers
+  // -------------------------------------------------------------------------
+
+  function paths() {
+    return store_.resolvePaths(store_.resolveBase());
+  }
+
+  function sha256(value) {
+    return createHash("sha256").update(value, "utf8").digest("hex");
+  }
+
+  function nowIso() {
+    return new Date().toISOString();
+  }
+
+  function formatAge(ms) {
+    const secs = Math.max(0, Math.floor(ms / 1000));
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h`;
+    return `${Math.floor(hours / 24)}d`;
+  }
+
+  /**
+   * How one human's presence renders.
+   *
+   * Never the word `live`: a human's state is a lease their own client wrote and
+   * that expires on read, so the honest reading is "declared, this long ago".
+   */
+  function presenceLabel(presence) {
+    const age = presence.ageMs != null ? ` (${formatAge(presence.ageMs)})` : "";
+    return `${presence.state}${age}`;
+  }
+
+  function shortTime(iso) {
+    return typeof iso === "string" ? iso.slice(11, 16) : "--:--";
+  }
+
+  /**
+   * Resolve `--as` against the store, refusing every combination that would let
+   * two identities share one name (§2.3).
+   *
+   * The order is deliberate. An invalid name is refused first because it is
+   * always a silent drop otherwise: `uniqueMembers` deletes it from `room.json`
+   * and `deliver` skips it as a recipient, so the client would report success
+   * for a message nobody can ever receive. A live registration is refused before
+   * the participant record is even considered, because a name held by a running
+   * process is not a name a human client may borrow.
+   */
+  function resolveIdentity(store_, p, name, opts) {
+    const { write, token, allowUnregistered = false } = opts;
+    if (typeof name !== "string" || name.length === 0) {
+      fail(`--as needs a name.`, EXIT_USAGE);
+    }
+    if (!store_.isValidName(name)) {
+      fail(
+        `"${name}" is not a valid rooms name: lowercase letters, digits, dash or underscore, ` +
+          `starting with a letter or digit, up to 48 characters. ` +
+          `Anything else is silently dropped from a room's members and skipped by delivery, ` +
+          `so it is refused here rather than reported as a successful send.`,
+        EXIT_USAGE,
+      );
+    }
+
+    const registration = store_.readRegistration(p, name);
+    if (write && registration != null && store_.isRegistrationLive(registration)) {
+      fail(
+        `Refusing to write as ${name}: that name belongs to a live pi session ` +
+          `(pid ${registration.pid}, ${registration.cwd}). Two identities sharing one name would ` +
+          `merge two inboxes into one. Start that lane with a different name, or message it with ` +
+          `\`rooms dm --to ${name}\` instead.`,
+      );
+    }
+
+    const participant = store_.readParticipant(p, name);
+    if (participant == null) {
+      if (write && !allowUnregistered) {
+        fail(
+          `${name} has no participant record, so there is nobody to act for. Writes are allowed ` +
+            `only for a name with a participant record in ${p.participants}. ` +
+            `\`rooms join\` is available without one, because a human may exist before its record.`,
+        );
+      }
+      return { name, participant: null, registration };
+    }
+
+    // The token. Read the plan's own sentence before changing it: this is a lock
+    // against two clients interleaving under one name, not authentication.
+    const participantFile = path.join(p.participants, `${name}.json`);
+    const expected = participant.client?.tokenSha256;
+    if (typeof expected !== "string" || expected.length === 0) {
+      fail(
+        `Participant ${participantFile} declares no client token, so no invocation can act as ` +
+          `${name}. Add client.tokenSha256 to that record (sha256 of the token you intend to use). ` +
+          `This is fail-closed on purpose: a record that cannot be locked is a name any client may ` +
+          `write under.`,
+      );
+    }
+    if (typeof token !== "string" || token.length === 0) {
+      fail(
+        `${name} is a human participant and is protected by a client token. Pass --token or set ` +
+          `PI_ROOMS_CLIENT_TOKEN. The record is ${participantFile}.`,
+      );
+    }
+    if (sha256(token) !== expected) {
+      fail(
+        `Token does not match the one recorded for ${name} in ${participantFile}. ` +
+          `The token is a lock against two clients interleaving under one name; ` +
+          `it is not a credential and it does not authenticate you to anyone.`,
+      );
+    }
+    return { name, participant, registration };
+  }
+
+  /**
+   * Write the presence lease §7 asks for: `online` on each invocation, expired on
+   * read, with no `away` verb and no way to set another name's presence.
+   *
+   * Only a name with a participant record gets a lease. A human may exist before
+   * its record — `join` allows that — but a lease for a name the store cannot see
+   * as a principal would be a claim with no subject.
+   */
+  function writeLease(store_, p, identity) {
+    if (identity?.participant == null) return null;
+    const now = Date.now();
+    try {
+      return store_.writePresence(p, {
+        name: identity.name,
+        state: "online",
+        lastSeenAt: new Date(now).toISOString(),
+        leaseUntil: new Date(now + LEASE_MS).toISOString(),
+        client: CLIENT_LABEL,
+        note: null,
+      });
+    } catch (error) {
+      // A presence failure must not fail the write it accompanied: the message is
+      // the point, the lease is a courtesy.
+      return { error: (error).message };
+    }
+  }
+
+  function requireFlag(flags, name) {
+    const value = flags.get(name);
+    if (typeof value !== "string" || value.length === 0) {
+      fail(`--${name} is required for this verb.`, EXIT_USAGE);
+    }
+    return value;
+  }
+
+  function messageText(rest) {
+    const text = rest.join(" ").trim();
+    if (text.length === 0) fail(`No message text given.`, EXIT_USAGE);
+    return text;
+  }
+
+  /**
+   * Read one post back out of the log to get its authoritative number.
+   *
+   * `appendPost` returns a number it read *before* appending — a TOCTOU — so it is
+   * not safe to publish. Position in the file is the order, so the honest number
+   * is the one a read assigns afterwards.
+   */
+  function seqOfPost(store_, p, room, id, fallback) {
+    const posts = store_.readPosts(p, room, 0, NO_LIMIT);
+    for (const post of posts) {
+      if (post.id === id) return post.seq;
+    }
+    return fallback;
+  }
+
+  // -------------------------------------------------------------------------
+  // Verbs
+  // -------------------------------------------------------------------------
+
+  const verbs = {};
+
+  verbs.who = ({ flags }) => {
+    const p = paths();
+    const agents = store_.listAgents(p);
+    const humans = store_.listParticipants(p);
+    const view = humans.map((human) => ({ human, presence: store_.readPresence(p, human.name) }));
+
+    if (flags.get("json")) {
+      return {
+        verb: "who",
+        agents: agents.map((a) => ({
+          name: a.name,
+          pid: a.pid,
+          cwd: a.cwd,
+          paneId: a.paneId ?? null,
+          tabId: a.tabId ?? null,
+          model: a.model ?? null,
+        })),
+        humans: view.map(({ human, presence }) => ({
+          participant: human,
+          presence,
+          label: presenceLabel(presence),
+        })),
+        note:
+          "Human presence is a lease written by their own client and expired on read, not " +
+          "liveness. `via` and `client` are self-declared and not authenticated.",
+      };
+    }
+
+    const width = Math.min(28, Math.max(12, ...agents.map((a) => a.name.length + 2)));
+    const lines = agents.map((a) => {
+      const pane = a.paneId != null ? a.paneId.padEnd(9) : "-".padEnd(9);
+      const tab = a.tabId != null ? `  ${a.tabId}` : "";
+      return (
+        `  ${a.name.padEnd(width)} ${pane} ${a.cwd}${tab}` +
+        `${a.model != null ? `  (${a.model})` : ""}`
+      );
+    });
+    const head =
+      agents.length === 0
+        ? "No agents registered."
+        : `${agents.length} agent(s)\n${lines.join("\n")}`;
+    if (view.length === 0) return `${head}\n\nNo human participants.`;
+
+    const humanWidth = Math.min(24, Math.max(10, ...view.map((h) => h.human.name.length + 2)));
+    const humanLines = view.map(({ human, presence }) => {
+      const label =
+        human.displayName != null && human.displayName.length > 0 ? ` (${human.displayName})` : "";
+      return (
+        `  ${human.name.padEnd(humanWidth)} ${presenceLabel(presence)}${label}` +
+        `${presence.client != null ? `  via ${presence.client}` : ""}`
+      );
+    });
+    return (
+      `${head}\n\n${view.length} human participant(s)\n${humanLines.join("\n")}\n` +
+      `Human presence is a lease, not liveness: \`away\` never means the human is ignoring you, ` +
+      `and a \`via\` label is self-declared and not authenticated, so provenance is a signal a ` +
+      `reader uses rather than a control the system enforces.`
+    );
+  };
+
+  verbs.list = ({ flags }) => {
+    const p = paths();
+    const rooms = store_.listRooms(p);
+    const rows = rooms.map((room) => ({
+      name: room.name,
+      members: room.members,
+      posts: store_.roomSeq(p, room.name),
+      createdBy: room.createdBy,
+      createdAt: room.createdAt,
+    }));
+    if (flags.get("json")) return { verb: "list", rooms: rows };
+    if (rows.length === 0) return "No rooms exist yet.";
+    const lines = rows.map(
+      (r) => `  ${r.name.padEnd(20)} ${String(r.posts).padStart(4)} post(s)  ${r.members.join(", ")}`,
+    );
+    return `${rows.length} room(s)\n${lines.join("\n")}`;
+  };
+
+  verbs.participants = ({ flags }) => {
+    const p = paths();
+    const records = store_.listParticipants(p);
+    if (flags.get("json")) return { verb: "participants", participants: records };
+    if (records.length === 0) return `No participant records in ${p.participants}.`;
+    const width = Math.min(24, Math.max(10, ...records.map((r) => r.name.length + 2)));
+    const lines = records.map((r) => {
+      const label = r.displayName != null && r.displayName.length > 0 ? ` (${r.displayName})` : "";
+      const token = r.client?.tokenSha256 != null ? "token" : "no token";
+      return `  ${r.name.padEnd(width)} ${r.kind.padEnd(6)} ${token.padEnd(9)}${label}`;
+    });
+    return `${records.length} participant(s) in ${p.participants}\n${lines.join("\n")}`;
+  };
+
+  verbs.presence = ({ flags, identity }) => {
+    const p = paths();
+    const rows = store_.listPresence(p).map(({ participant, presence }) => ({
+      name: participant.name,
+      kind: participant.kind,
+      displayName: participant.displayName ?? null,
+      ...presence,
+      label: presenceLabel(presence),
+    }));
+    const mine = identity ? store_.readPresence(p, identity.name) : null;
+    if (flags.get("json")) {
+      return { verb: "presence", presence: rows, self: mine };
+    }
+    if (rows.length === 0) return `No participant records in ${p.participants}, so no presence.`;
+    const width = Math.min(24, Math.max(10, ...rows.map((r) => r.name.length + 2)));
+    const lines = rows.map(
+      (r) => `  ${r.name.padEnd(width)} ${r.label.padEnd(12)}${r.client != null ? ` via ${r.client}` : ""}`,
+    );
+    return (
+      `${rows.length} presence record(s), state derived at read time\n${lines.join("\n")}\n` +
+      `A lease is not liveness: \`online\` means a lease is live, \`away\` means the last thing that ` +
+      `client declared was a while ago, \`unknown\` means nothing was ever declared.`
+    );
+  };
+
+  verbs.read = async ({ flags, identity }) => {
+    const p = paths();
+    const roomFlag = flags.get("room");
+    const follow = flags.get("follow") === true;
+    const asJson = flags.get("json") === true;
+
+    if (follow && roomFlag == null) {
+      fail(`--follow streams a room, so it needs --room R.`, EXIT_USAGE);
+    }
+    if (roomFlag == null) {
+      // No room: this is the caller's own inbox. It is the only read that writes,
+      // and what it writes is `deliveredAt` — "this client now has these bytes".
+      if (identity == null) {
+        fail(
+          `read needs --room R for room history, or --as NAME for your own inbox.`,
+          EXIT_USAGE,
+        );
+      }
+      // A participant record is required even to *read*, because draining an inbox
+      // is a write: it archives the envelope and stamps `deliveredAt`. A lane's
+      // name has no participant record, so this is also the rule that stops the
+      // CLI from draining a lane's mail — §2.3's "another lane's inbox" — through
+      // the one verb that looks read-only.
+      if (identity.participant == null) {
+        fail(
+          `${identity.name} has no participant record, so it has no inbox this client may drain. `
+            + `Reading your own mail archives it and stamps deliveredAt, which is a write; a lane's `
+            + `inbox belongs to that lane's session. There is no flag that reaches another name's mail.`,
+        );
+      }
+      const pending = store_.drain(p, identity.name);
+      const rendered = pending.map(({ message }) => ({
+        id: message.id,
+        from: message.from,
+        to: message.to,
+        text: message.text,
+        sentAt: message.sentAt,
+        room: message.room ?? null,
+        roomSeq: message.roomSeq ?? null,
+        replyTo: message.replyTo ?? null,
+        via: message.via ?? null,
+        client: message.client ?? null,
+      }));
+      // Render first, then stamp: the stamp means "a screen showed this", so it
+      // must not precede the rendering it attests. `archive` moves the envelope to
+      // inbox/<name>/read/ and writes deliveredAt through markDelivered, which is
+      // the same transition the extension's delivery loop performs.
+      for (const { file, message } of pending) {
+        store_.archive(p, identity.name, file, message);
+      }
+      if (asJson) {
+        return {
+          verb: "read",
+          kind: "inbox",
+          name: identity.name,
+          messages: rendered,
+          delivered: rendered.map((m) => m.id),
+        };
+      }
+      if (rendered.length === 0) return `No new mail for ${identity.name}.`;
+      const lines = rendered.map((m) => {
+        const where = m.room != null ? `room ${m.room} #${m.roomSeq ?? "?"}` : `dm from ${m.from}`;
+        return `${shortTime(m.sentAt)} [${m.id.slice(0, 8)}] ${where}\n${m.text}`;
+      });
+      return `${rendered.length} message(s) for ${identity.name}\n\n${lines.join("\n\n")}`;
+    }
+
+    const room = requireFlag(flags, "room");
+    if (!store_.isValidRoom(room)) fail(`"${room}" is not a valid room name.`, EXIT_USAGE);
+    const roomRecord = store_.readRoom(p, room);
+    if (roomRecord == null) fail(`Room ${room} does not exist.`);
+
+    const sinceRaw = flags.get("since");
+    let since = 0;
+    if (typeof sinceRaw === "string" && sinceRaw.length > 0) {
+      const parsed = Number(sinceRaw);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        fail(`--since takes a non-negative whole number, the last #N you saw.`, EXIT_USAGE);
+      }
+      since = parsed;
+    }
+
+    if (follow) {
+      return followRoom({ store_: store_, p, room, since, asJson, identity });
+    }
+
+    // No limit: a limit would return the newest N of a backlog and skip the start,
+    // and a mid-catch-up truncation skips the middle.
+    const posts = store_.readPosts(p, room, since, NO_LIMIT);
+    const total = store_.roomSeq(p, room);
+    if (asJson) {
+      return {
+        verb: "read",
+        kind: "room",
+        room: {
+          name: roomRecord.name,
+          members: roomRecord.members,
+          createdBy: roomRecord.createdBy,
+          createdAt: roomRecord.createdAt,
+        },
+        posts,
+        from: posts.length > 0 ? posts[0].seq : null,
+        to: posts.length > 0 ? posts[posts.length - 1].seq : null,
+        total,
+      };
+    }
+    if (posts.length === 0) {
+      return since >= total
+        ? `No new posts in ${room} (last #${total}).`
+        : `Room ${room} has no posts.`;
+    }
+    const lines = posts.map(
+      (post) =>
+        `#${post.seq} ${shortTime(post.sentAt)} ${post.from}${post.via != null ? ` [${post.via}]` : ""}: ` +
+        `${post.text}`,
+    );
+    return (
+      `Room ${room} · ${roomRecord.members.length} members · showing #${posts[0].seq}-#${posts[posts.length - 1].seq}\n` +
+      `${lines.join("\n")}\n` +
+      `(--follow streams new posts as NDJSON; message ids are in --json output.)`
+    );
+  };
+
+  /**
+   * `read --follow`: one JSON object per line, flushed as it happens.
+   *
+   * Three rules from §4 and §5.4, each of which is a silent failure if broken:
+   * never pass `limit` (a backlog would start in the middle), never renumber (the
+   * reader tracks `since`), and say a gap out loud rather than closing it quietly —
+   * a reader that resequences invents history that was never written.
+   */
+  async function followRoom({ store_, p, room, since, asJson, identity }) {
+    let cursor = since;
+    let gapReportedFor = -1;
+    let lastLease = 0;
+    let stopped = false;
+
+    const out = (obj) => {
+      process.stdout.write(`${JSON.stringify(obj)}\n`);
+    };
+    const stop = () => {
+      stopped = true;
+    };
+    // A closed pane is not an error: the pipe closed, so the stream is over.
+    process.stdout.on("error", (error) => {
+      if (error?.code === "EPIPE") process.exit(0);
+      throw error;
+    });
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+
+    // The lease is refreshed while the pane is open. A 60s lease that is written
+    // once and left to expire would make a human who is sitting in front of the
+    // stream read as `away` after a minute, which is exactly the over-reading the
+    // plan's presence section exists to prevent.
+    if (identity?.participant != null) {
+      writeLease(store_, p, identity);
+      lastLease = Date.now();
+    }
+
+    if (!asJson) {
+      // Human-facing preamble goes to stderr so stdout stays pure NDJSON. Mixing
+      // them would make the first line of the stream unparseable.
+      process.stderr.write(`following ${room} from #${cursor} (${POLL_MS}ms poll). Ctrl-C to stop.\n`);
+    }
+
+    while (!stopped) {
+      const posts = store_.readPosts(p, room, cursor, NO_LIMIT);
+      if (posts.length > 0) {
+        const first = posts[0].seq;
+        if (first > cursor + 1 && gapReportedFor !== cursor) {
+          out({
+            type: "gap",
+            room,
+            after: cursor,
+            next: first,
+            missed: first - cursor - 1,
+            note: "posts are missing between `after` and `next`; the stream did not skip them silently",
+          });
+          gapReportedFor = cursor;
+        }
+        for (const post of posts) {
+          out({ type: "post", room, ...post });
+          cursor = post.seq;
+        }
+      }
+      if (identity?.participant != null && Date.now() - lastLease >= HEARTBEAT_MS) {
+        writeLease(store_, p, identity);
+        lastLease = Date.now();
+      }
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+    }
+    process.stderr.write(`stopped following ${room} at #${cursor}.\n`);
+    return null;
+  }
+
+  verbs.post = ({ flags, identity, rest }) => {
+    const p = paths();
+    const room = requireFlag(flags, "room");
+    if (!store_.isValidRoom(room)) fail(`"${room}" is not a valid room name.`, EXIT_USAGE);
+    const roomRecord = store_.readRoom(p, room);
+    if (roomRecord == null) fail(`Room ${room} does not exist. Creating a room is a lane action in slice 1.`);
+    if (!roomRecord.members.includes(identity.name)) {
+      fail(
+        `You are not a member of ${room} (members: ${roomRecord.members.join(", ")}). ` +
+          `Join it with \`rooms join --room ${room} --as ${identity.name}\`.`,
+      );
+    }
+
+    const raw = messageText(rest);
+    const body = store_.sanitize(raw);
+    // The cap used to live only in the tool handlers, so a writer that appended
+    // directly bypassed it and every reader rendered the full post. It is enforced
+    // by the writer and defensively in `appendPost` now; what matters here is that
+    // the human is told, because a silently shortened draft is the one outcome a
+    // client must never produce.
+    //
+    // Tested against the cap rather than by comparing sanitized to raw: stripping a
+    // control character also changes the text, and reporting that as truncation
+    // would tell the human their tail was dropped when it was not.
+    const truncated = store_.cleanMessage(raw).length > store_.MAX_MESSAGE_CHARS;
+
+
+    const recipients = roomRecord.members.filter((m) => m !== identity.name);
+    // One id for the log line and the envelope. Minting a second uuid left
+    // receipts naming an id the history did not contain, so no client could say
+    // "the message I was handed is line #N".
+    const id = randomUUID();
+    const sentAt = nowIso();
+    const appended = store_.appendPost(p, room, {
+      id,
+      from: identity.name,
+      text: body,
+      sentAt,
+      recipients,
+      via: "cli",
+      client: CLIENT_LABEL,
+    });
+    // Read back rather than trusting `appended`: that number was read before the
+    // append, so a concurrent writer makes it wrong.
+    const seq = seqOfPost(store_, p, room, id, appended);
+    const written = store_.deliver(p, {
+      id,
+      from: identity.name,
+      to: recipients,
+      text: body,
+      sentAt,
+      room,
+      roomSeq: seq,
+      via: "cli",
+      client: CLIENT_LABEL,
+    });
+    const skipped = recipients.filter((m) => !written.includes(m));
+
+    if (truncated) {
+      process.stderr.write(
+        `message truncated to ${store_.MAX_MESSAGE_CHARS} characters; the post ends with the ` +
+          `truncation marker. The tail was not sent.\n`,
+      );
+    }
+    const receipt = store_.receiptPathFor(p, id);
+    if (flags.get("json")) {
+      return {
+        verb: "post",
+        room,
+        seq,
+        id,
+        from: identity.name,
+        recipients: written,
+        skipped,
+        truncated,
+        receipt,
+        via: "cli",
+        client: CLIENT_LABEL,
+        note: "queued is not delivered. deliveredAt appears when a recipient's session takes it.",
+      };
+    }
+    return (
+      `Posted to ${room} as #${seq}, pushed to ${written.length} member(s)${written.length > 0 ? `: ${written.join(", ")}` : ""}.` +
+      (skipped.length > 0 ? `\nSkipped (invalid or self): ${skipped.join(", ")}` : "") +
+      `\nid ${id} · receipt ${receipt}\n` +
+      `Queued is not delivered: \`via\` and \`client\` on the post and envelope are self-declared, ` +
+      `not authenticated.`
+    );
+  };
+
+  verbs.dm = ({ flags, identity, rest }) => {
+    const p = paths();
+    const targets = store_.uniqueMembers(
+      String(flags.get("to") ?? "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0)
+        .filter((value) => value !== identity.name),
+    );
+    if (targets.length === 0) fail(`--to needs at least one name other than yourself.`, EXIT_USAGE);
+
+    const raw = messageText(rest);
+    const body = store_.sanitize(raw);
+    const truncated = store_.cleanMessage(raw).length > store_.MAX_MESSAGE_CHARS;
+
+    const message = {
+      id: randomUUID(),
+      from: identity.name,
+      // The recipient set is recorded on the message, which is what lets any
+      // recipient answer everyone with rooms_reply_all. A reply is a new message
+      // (§3.3): there is no thread, and `replyTo` is only set when this dm answers
+      // a specific message, which is `--reply-to`.
+      to: targets,
+      text: body,
+      sentAt: nowIso(),
+      via: "cli",
+      client: CLIENT_LABEL,
+    };
+    const replyTo = flags.get("reply-to");
+    if (typeof replyTo === "string" && replyTo.length > 0) message.replyTo = replyTo;
+
+    const written = store_.deliver(p, message);
+    const skipped = targets.filter((t) => !written.includes(t));
+    if (written.length === 0) {
+      fail(`No recipient accepted the message (skipped: ${skipped.join(", ") || "none"}).`);
+    }
+    if (truncated) {
+      process.stderr.write(
+        `message truncated to ${store_.MAX_MESSAGE_CHARS} characters; it ends with the truncation ` +
+          `marker and the tail was not sent.\n`,
+      );
+    }
+    const receipt = store_.receiptPathFor(p, message.id);
+    if (flags.get("json")) {
+      return {
+        verb: "dm",
+        id: message.id,
+        from: message.from,
+        to: message.to,
+        delivered: written,
+        skipped,
+        truncated,
+        receipt,
+        replyTo: message.replyTo ?? null,
+        via: "cli",
+        client: CLIENT_LABEL,
+      };
+    }
+    return (
+      `Queued to ${written.length} recipient(s): ${written.join(", ")}` +
+      (skipped.length > 0 ? `\nSkipped: ${skipped.join(", ")}` : "") +
+      `\nid ${message.id} · receipt ${receipt}\n` +
+      `Queued is not delivered. deliveredAt appears when that recipient's session takes it; ` +
+      `readAt appears when a human client renders it.`
+    );
+  };
+
+  verbs.ack = ({ flags, identity }) => {
+    const p = paths();
+    const id = requireFlag(flags, "id");
+    // Only a message actually addressed to this name may be acknowledged. The
+    // receipt is keyed by recipient, so stamping for anyone else would write
+    // another name's receipt — the one thing §2.3 says no `--as` makes legal.
+    const received = store_.findReceived(p, identity.name, id);
+    if (received == null) {
+      fail(
+        `No message ${id} in ${identity.name}'s inbox. \`ack\` marks your own mail as actually ` +
+          `seen; it cannot reach another name's inbox or receipts, and there is no flag that ` +
+          `makes it.`,
+        EXIT_USAGE,
+      );
+    }
+    // readAt, deliberately not deliveredAt: `read` stamps deliveredAt because the
+    // client now has the bytes, while this says a screen showed them. Collapsing
+    // the two would make readAt mean "opened a stream".
+    store_.markRead(p, id, identity.name);
+    const record = store_.readReceipts(p, id);
+    const mine = record?.receipts?.[identity.name] ?? null;
+    if (flags.get("json")) {
+      return { verb: "ack", id, recipient: identity.name, receipt: mine, receiptFile: store_.receiptPathFor(p, id) };
+    }
+    const stamps = mine == null ? "(none)" : `queued ${mine.queuedAt}` +
+      `${mine.deliveredAt != null ? ` · delivered ${mine.deliveredAt}` : " · delivered unknown"}` +
+      `${mine.readAt != null ? ` · read ${mine.readAt}` : ""}`;
+    return (
+      `Stamped readAt for ${identity.name} on ${id}.\n` +
+      `receipt ${store_.receiptPathFor(p, id)}\n${stamps}\n` +
+      `readAt means a screen showed these bytes — not acted on, and not agreed with.`
+    );
+  };
+
+  verbs.join = ({ flags, identity }) => {
+    const p = paths();
+    const room = requireFlag(flags, "room");
+    if (!store_.isValidRoom(room)) fail(`"${room}" is not a valid room name.`, EXIT_USAGE);
+    // Reading and writing under the room's lock is `addRoomMember`'s job; a second
+    // unlocked writer on room.json would lose a concurrent lane's membership.
+    const after = store_.addRoomMember(p, room, identity.name);
+    if (after == null) fail(`Room ${room} does not exist. Creating a room is a lane action in slice 1.`);
+    if (flags.get("json")) {
+      return { verb: "join", room: after.name, members: after.members, as: identity.name };
+    }
+    return `Joined ${room} as ${identity.name} (${after.members.length} members): ${after.members.join(", ")}.`;
+  };
+
+  // -------------------------------------------------------------------------
+  // Dispatch
+  // -------------------------------------------------------------------------
+
+  const VALUE_FLAGS = new Set(["as", "token", "room", "since", "to", "id", "reply-to"]);
+  /** Verbs that write on behalf of `--as`, and so must not fall back to a guess. */
+  const WRITE_VERBS = new Set(["post", "dm", "ack", "join"]);
+  /**
+   * Writes allowed for a name with no participant record.
+   *
+   * `join` only. A human may exist before its record does — §7's walkthrough has
+   * the leader create the room and the operator join it — and refusing to add a
+   * name the store cannot yet see as a principal would make the record the
+   * *precondition* of membership rather than a reservation on it. Every other
+   * write acts as a principal, so every other write needs one.
+   */
+  const UNREGISTERED_WRITE_VERBS = new Set(["join"]);
+
+  async function run(argv) {
+    const { flags, rest } = parseArgs(argv, VALUE_FLAGS);
+    if (flags.get("help") === true || rest.length === 0) {
+      process.stdout.write(HELP);
+      return 0;
+    }
+    if (flags.get("version") === true) {
+      process.stdout.write(`${CLIENT_LABEL}\n`);
+      return 0;
+    }
+    const verb = rest[0];
+    const handler = verbs[verb];
+    if (handler == null) {
+      fail(`Unknown verb "${verb}". Run \`rooms --help\`.` , EXIT_USAGE);
+    }
+
+    const p = paths();
+    const asFlag = flags.get("as");
+    const token = flags.get("token") ?? process.env.PI_ROOMS_CLIENT_TOKEN;
+    const identity =
+      typeof asFlag === "string" && asFlag.length > 0
+        ? resolveIdentity(store_, p, asFlag, {
+            write: WRITE_VERBS.has(verb),
+            token,
+            allowUnregistered: UNREGISTERED_WRITE_VERBS.has(verb),
+          })
+        : null;
+
+    if (WRITE_VERBS.has(verb) && identity == null) {
+      // Not a fallback to defaultName(cwd): that is how a human's shell ends up
+      // posting under a lane's derived name.
+      fail(
+        `${verb} needs --as NAME. A write is never attributed by guessing from the directory, ` +
+          `because a guess that lands on a lane's name posts in that lane's voice.`,
+        EXIT_USAGE,
+      );
+    }
+
+    // Presence is static in slice 1: every invocation by a name that has a
+    // participant record writes an `online` lease and lets it expire. There is no
+    // `presence set` and no `away` verb, deliberately — §7 stubs both. It is
+    // written before the verb runs, so a verb that fails still refreshed the lease:
+    // the invocation is the heartbeat, not the success.
+    const lease = writeLease(store_, p, identity);
+
+    const result = await handler({ flags, rest: rest.slice(1), identity, argv, lease });
+    if (result == null) return 0;
+    if (typeof result === "string") {
+      process.stdout.write(`${result}\n`);
+      return 0;
+    }
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return 0;
+  }
+
+  let code = 1;
+  try {
+    code = await run(process.argv.slice(2));
+  } catch (error) {
+    const isCli = error instanceof CliError;
+    if (process.argv.includes("--json")) {
+      process.stdout.write(
+        `${JSON.stringify({ ok: false, error: error?.message ?? String(error) })}\n`,
+      );
+    }
+    process.stderr.write(`rooms: ${isCli ? error.message : error?.stack ?? String(error)}\n`);
+    code = isCli ? error.exitCode : 1;
+  }
+  process.exit(code);
+}
