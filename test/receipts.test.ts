@@ -25,8 +25,10 @@ import { fileURLToPath } from "node:url";
 import init from "../index.ts";
 
 import {
+  bootId,
   deliver,
   drain,
+  isAlive,
   markDelivered,
   markRead,
   readPosts,
@@ -320,6 +322,140 @@ test("a live lock fails in bounded time, naming the lock path", () => {
   // Never blocks indefinitely: a handful of short waits and then a loud failure.
   assert.ok(elapsed < 2_000, `failed in ${elapsed}ms, which is bounded`);
   assert.equal(fs.existsSync(lockPath), true, "a lock this process did not take is not removed");
+});
+
+// ---------------------------------------------------------------------------
+// L3 — a lock that outlives a reboot
+//
+// A lock file survives the reboot; the pid inside it does not. After the reboot
+// the kernel hands that number to an unrelated process, so the lock reads as
+// *held* by a bare pid test until the budget expires — and every write after it
+// throws, forever. The boot id is the evidence that the holder cannot be inside
+// its critical section, exactly as it is for a stale registration.
+// ---------------------------------------------------------------------------
+
+/** A boot id no machine running these tests can be in. */
+const EARLIER_BOOT = "00000000-0000-0000-0000-000000000000";
+
+test("a lock from an earlier boot does not block a write, however alive its pid looks", (t) => {
+  // The exact post-reboot state: the file says `pid: N`, and N is live *now* —
+  // it is this very process. Only the boot id says the holder is gone.
+  const current = bootId();
+  if (current == null) {
+    t.skip("no boot id on this platform, so there is nothing to compare");
+    return;
+  }
+  const paths = tempPaths();
+  const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  deliver(paths, message(id, ["beta"]));
+
+  const lockPath = `${receiptFile(paths, id)}.lock`;
+  const old = new Date(Date.now() - 60_000).toISOString();
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: old, bootId: EARLIER_BOOT }));
+  assert.notEqual(EARLIER_BOOT, current, "precondition: the lock names a different boot");
+  assert.equal(isAlive(process.pid), true, "precondition: the pid it names is alive");
+
+  // Without the boot check this throws after the full wait budget, and keeps
+  // throwing on every later write: the wedge.
+  markDelivered(paths, id, "beta");
+
+  assert.ok(readReceipts(paths, id)!.receipts.beta.deliveredAt != null, "the write went through");
+  assert.equal(fs.existsSync(lockPath), false, "and the foreign-boot lock is gone");
+});
+
+test("a lock from an earlier boot with no pid recovers from its age", (t) => {
+  // A partial write, or a body from a build older than a field: the boot id is
+  // present but nothing else usable is. It must not wedge either.
+  if (bootId() == null) {
+    t.skip("no boot id on this platform, so there is nothing to compare");
+    return;
+  }
+  const paths = tempPaths();
+  const id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  deliver(paths, message(id, ["beta"]));
+
+  const lockPath = `${receiptFile(paths, id)}.lock`;
+  const old = new Date(Date.now() - 60_000);
+  fs.writeFileSync(lockPath, JSON.stringify({ startedAt: old.toISOString(), bootId: EARLIER_BOOT }));
+  fs.utimesSync(lockPath, old, old);
+
+  markDelivered(paths, id, "beta");
+
+  assert.ok(readReceipts(paths, id)!.receipts.beta.deliveredAt != null, "the write went through");
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
+test("a lock from this boot held by a live pid is still respected", (t) => {
+  // The regression the fix must not introduce: a genuinely held lock is not
+  // free just because we now understand boots. Same pid, same boot, fresh.
+  const current = bootId();
+  if (current == null) {
+    t.skip("no boot id on this platform, so there is nothing to compare");
+    return;
+  }
+  const paths = tempPaths();
+  const id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  deliver(paths, message(id, ["beta"]));
+
+  const lockPath = `${receiptFile(paths, id)}.lock`;
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), bootId: current }),
+  );
+
+  assert.throws(
+    () => markDelivered(paths, id, "beta"),
+    (error: Error) => {
+      assert.match(error.message, /another process holds it/);
+      return true;
+    },
+  );
+  assert.equal(fs.existsSync(lockPath), true, "a lock from this boot is not stolen");
+  assert.equal(readReceipts(paths, id)?.receipts.beta?.deliveredAt, undefined, "and nothing was written");
+});
+
+test("a lock with no boot id falls through to the pid test, as an older writer's does", () => {
+  // Compatibility: a writer running the previous build stamps no boot id. Its
+  // live lock must still hold, and its dead lock must still recover. Absence is
+  // not evidence of a foreign boot.
+  const paths = tempPaths();
+  const id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  deliver(paths, message(id, ["beta"]));
+
+  const lockPath = `${receiptFile(paths, id)}.lock`;
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+
+  assert.throws(() => markDelivered(paths, id, "beta"), /another process holds it/);
+  assert.equal(fs.existsSync(lockPath), true);
+
+  // And the same shape with a dead pid still recovers, unchanged.
+  fs.writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: 999999, startedAt: new Date(Date.now() - 60_000).toISOString() }),
+  );
+  markDelivered(paths, id, "beta");
+  assert.ok(readReceipts(paths, id)!.receipts.beta.deliveredAt != null, "the write went through");
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
+test("the lock this process takes carries this boot's id", (t) => {
+  // The stamp itself: without it the guard above has nothing to compare, so a
+  // writer that forgets to record the boot silently reopens the wedge.
+  const current = bootId();
+  if (current == null) {
+    t.skip("no boot id on this platform, so there is nothing to record");
+    return;
+  }
+  const paths = tempPaths();
+  const target = path.join(paths.base, "guarded.json");
+  const lockPath = `${target}.lock`;
+
+  withFileLock(target, () => {
+    const body = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { pid: number; bootId?: string };
+    assert.equal(body.bootId, current, "the lock records the boot it was taken in");
+    assert.equal(body.pid, process.pid);
+    return null;
+  });
 });
 
 test("a lock file is removed after a throwing fn", () => {

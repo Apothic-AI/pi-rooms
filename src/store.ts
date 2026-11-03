@@ -287,8 +287,7 @@ function isDeadState(procId: string | null | undefined): boolean {
  */
 export function isRegistrationLive(reg: Registration): boolean {
   if (!isAlive(reg.pid)) return false;
-  const current = bootId();
-  if (reg.bootId != null && current != null && reg.bootId !== current) return false;
+  if (fromEarlierBoot(reg.bootId, bootId())) return false;
   const identity = procIdentity(reg.pid);
   if (identity != null && reg.procId != null) {
     // A dead state is checked first: a zombie keeps its starttime, so the
@@ -303,8 +302,7 @@ export function isRegistrationLive(reg: Registration): boolean {
 /** Why a registration is considered gone, for diagnostics. */
 export function livenessDiagnosis(reg: Registration): string | null {
   if (!isAlive(reg.pid)) return "no such process";
-  const current = bootId();
-  if (reg.bootId != null && current != null && reg.bootId !== current) return "registered in an earlier boot";
+  if (fromEarlierBoot(reg.bootId, bootId())) return "registered in an earlier boot";
   const identity = procIdentity(reg.pid);
   if (identity != null && reg.procId != null) {
     if (isDeadState(identity)) return "process is a zombie";
@@ -355,6 +353,13 @@ const LOCK_BACKOFF_MS = 25;
 interface LockFile {
   pid: number;
   startedAt: string;
+  /**
+   * Boot the lock was taken under, when the platform names one.
+   *
+   * Optional because a writer running an older build does not stamp it; a lock
+   * without one falls back to the pid-and-age test below.
+   */
+  bootId?: string;
 }
 
 /**
@@ -368,18 +373,44 @@ function sleepSync(ms: number): void {
 }
 
 /**
+ * Whether a recorded boot is not the one we are running in.
+ *
+ * One definition, used by registrations and by locks, so "this is from an
+ * earlier boot" means the same thing everywhere. False when either side is
+ * unknown: without two boot ids there is nothing to compare, and guessing would
+ * be the caller's bug to pay for, not ours to hide.
+ */
+function fromEarlierBoot(recorded: string | null | undefined, current: string | null): boolean {
+  return recorded != null && current != null && recorded !== current;
+}
+
+/**
  * Whether a lock file has been abandoned by a holder that is gone.
  *
  * Reuses {@link isAlive}, the same liveness test presence uses, so there is one
- * definition of "this process exists" in the module. What it deliberately does
- * *not* reuse is the boot-id / proc-identity vocabulary: those exist because a
- * registration lives for hours and a pid can be recycled in that time. A lock is
- * held for milliseconds, so there is no long window for a reuse to hide in, and
- * the age requirement below is the guard that matters — a *live* pid that merely
- * inherited the number is waited out and then reported, never treated as dead.
+ * definition of "this process exists" in the module, and the same boot-id test
+ * presence uses, for the same reason: a bare pid is not enough after a reboot.
+ *
+ * The order matters. A lock stamped with a *different* boot cannot still be
+ * inside its critical section — no process survives a reboot — so it is
+ * abandoned no matter how alive its pid looks now; that pid was handed to
+ * somebody unrelated, and treating it as a holder wedges the file permanently,
+ * because the wait budget never expires a lock it believes is held. Only then
+ * does the pid test run, and only for a lock from this boot (or one carrying no
+ * boot id at all, as an older writer's does).
+ *
+ * When {@link bootId} is unreadable we cannot compare boots, and the choice is
+ * between two wrong answers. We fall through to the pid-and-age test rather than
+ * declaring the lock foreign: an unreadable boot id is not evidence that the
+ * holder died, and assuming it did would put two live writers inside the same
+ * read-modify-write — the silent lost update this lock exists to prevent. A
+ * wedge is loud, names the file, and the caller can remove it; a lost update is
+ * silent and permanent. So the unreadable case degrades to exactly the behaviour
+ * before this guard, which is the honest floor.
  */
 function lockIsAbandoned(lockPath: string): boolean {
   const held = readJson<LockFile>(lockPath);
+  if (held != null && fromEarlierBoot(held.bootId, bootId())) return true;
   if (held != null && isAlive(held.pid)) return false;
   // Age comes from the holder's own stamp when it is readable, and from the file
   // otherwise: a writer killed between `open` and `write` leaves an empty lock,
@@ -432,7 +463,12 @@ export function withFileLock<T>(file: string, fn: () => T): T {
     }
     if (fd != null) {
       try {
-        fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, startedAt }, null, 2)}\n`);
+        // The boot is stamped alongside the pid so a lock that outlives a reboot
+        // is recognisable as such: the pid it names belongs to somebody else now.
+        const boot = bootId();
+        const body: LockFile =
+          boot == null ? { pid: process.pid, startedAt } : { pid: process.pid, startedAt, bootId: boot };
+        fs.writeFileSync(fd, `${JSON.stringify(body, null, 2)}\n`);
       } finally {
         fs.closeSync(fd);
       }
