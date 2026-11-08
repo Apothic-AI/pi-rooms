@@ -10,22 +10,27 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+  addRoomMember,
   appendPost,
+  appendRoomEvent,
   archive,
   claimName,
   createRoom,
   defaultName,
   deliver,
+  discardQueuedRoomMessages,
   drain,
   findReceived,
   isAlive,
   isValidName,
   isValidRoom,
+  LEAVE_EVENT_TEXT,
   listAgents,
   listRooms,
   readPosts,
   readRoom,
   register,
+  removeRoomMember,
   resolvePaths,
   roomSeq,
   sanitize,
@@ -231,4 +236,118 @@ test("isAlive recognises this process and rejects nonsense", () => {
   assert.equal(isAlive(process.pid), true);
   assert.equal(isAlive(999999), false);
   assert.equal(isAlive(0), false);
+});
+
+// ---------------------------------------------------------------------------
+// Leaving a room (FT-24)
+// ---------------------------------------------------------------------------
+
+function seededRoom(paths: ReturnType<typeof tempPaths>, members: string[]): Room {
+  const room: Room = {
+    name: "r",
+    members,
+    createdBy: members[0] ?? "a",
+    createdAt: new Date().toISOString(),
+  };
+  createRoom(paths, room);
+  return room;
+}
+
+function roomMessage(id: string, from: string, to: string[], room: string, text = "hi"): Delivery {
+  return {
+    id,
+    from,
+    to,
+    text,
+    sentAt: new Date().toISOString(),
+    room,
+    roomSeq: 1,
+  };
+}
+
+test("leaving removes membership, and the room persists when it empties", () => {
+  const paths = tempPaths();
+  const room = seededRoom(paths, ["a", "b"]);
+
+  assert.equal(removeRoomMember(paths, room, "b"), true);
+  assert.deepEqual(readRoom(paths, "r")?.members, ["a"]);
+  assert.equal(removeRoomMember(paths, readRoom(paths, "r")!, "b"), false, "already out: no change");
+
+  assert.equal(removeRoomMember(paths, readRoom(paths, "r")!, "a"), true);
+  assert.deepEqual(readRoom(paths, "r")?.members, [], "the last member may leave");
+  assert.equal(listRooms(paths).length, 1, "an empty room stays on disk, so it stays joinable");
+});
+
+test("joining reports a change only the first time", () => {
+  const paths = tempPaths();
+  const room = seededRoom(paths, ["a"]);
+
+  assert.equal(addRoomMember(paths, room, "b"), true);
+  assert.equal(addRoomMember(paths, readRoom(paths, "r")!, "b"), false, "a repeated join is a no-op");
+  assert.deepEqual(readRoom(paths, "r")?.members, ["a", "b"]);
+  assert.equal(addRoomMember(paths, readRoom(paths, "r")!, "bad name"), false, "invalid names are refused");
+});
+
+test("a room event is history with no recipients, sharing the sequence space", () => {
+  const paths = tempPaths();
+  seededRoom(paths, ["a", "b"]);
+
+  assert.equal(appendRoomEvent(paths, "r", "b", LEAVE_EVENT_TEXT), 1);
+  assert.equal(
+    appendPost(paths, "r", { from: "a", text: "carrying on", sentAt: new Date().toISOString(), recipients: [] }),
+    2,
+  );
+
+  const posts = readPosts(paths, "r");
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].kind, "event");
+  assert.deepEqual(posts[0].recipients, [], "an event is delivered to nobody");
+  assert.equal(posts[0].from, "b");
+  assert.equal(posts[0].text, LEAVE_EVENT_TEXT);
+  assert.equal(posts[1].kind, undefined, "an ordinary post keeps the absent default");
+
+  // Nothing was written into anyone's inbox by the event.
+  assert.deepEqual(drain(paths, "a"), []);
+  assert.deepEqual(drain(paths, "b"), []);
+});
+
+test("discarding queued room messages touches only that agent, only that room, never read/", () => {
+  const paths = tempPaths();
+  seededRoom(paths, ["a", "b", "g"]);
+  createRoom(paths, { name: "other", members: ["a", "b"], createdBy: "a", createdAt: new Date().toISOString() });
+
+  // Three queued room-r messages for b, one of which is then delivered/archived.
+  deliver(paths, roomMessage("11111111-1111-1111-1111-111111111111", "a", ["b"], "r"));
+  deliver(paths, roomMessage("22222222-2222-2222-2222-222222222222", "a", ["b"], "r"));
+  deliver(paths, roomMessage("33333333-3333-3333-3333-333333333333", "a", ["b", "g"], "r"));
+  // A second room's post, and a DM, both queued for b.
+  deliver(paths, roomMessage("44444444-4444-4444-4444-444444444444", "a", ["b"], "other"));
+  deliver(paths, {
+    id: "55555555-5555-5555-5555-555555555555",
+    from: "a",
+    to: ["b"],
+    text: "direct",
+    sentAt: new Date().toISOString(),
+  });
+
+  const archived = drain(paths, "b").find(
+    (entry) => entry.message.id === "22222222-2222-2222-2222-222222222222",
+  )!;
+  archive(paths, "b", archived.file, archived.message);
+  assert.equal(drain(paths, "b").length, 4, "four queued for b before the discard");
+
+  assert.equal(discardQueuedRoomMessages(paths, "b", "r"), 2);
+
+  const left = drain(paths, "b").map((entry) => entry.message.id).sort();
+  assert.deepEqual(left, [
+    "44444444-4444-4444-4444-444444444444",
+    "55555555-5555-5555-5555-555555555555",
+  ]);
+  assert.ok(
+    fs.existsSync(path.join(paths.inbox, "b", "read", "22222222-2222-2222-2222-222222222222.json")),
+    "the read/ archive survives the discard",
+  );
+  // g was never the leaver, so its inbox is untouched.
+  assert.equal(drain(paths, "g").length, 1);
+  assert.equal(discardQueuedRoomMessages(paths, "b", "r"), 0, "discarding twice is harmless");
 });

@@ -124,6 +124,11 @@ When it does proceed, it names the rooms left behind. So the order that avoids t
 problem entirely is: **pin first, then create rooms over the lane.** A rename is
 only safe before a lane has joined anything.
 
+A rename is therefore an *implicit* parting: it drops the old name out of the room
+without appending an event and without discarding that name's queue. To part
+loudly — with a history event and a clean queue — use `rooms_leave` first. See
+[Joining and leaving](#joining-and-leaving).
+
 ### Correlating a name with a pane
 
 When pi runs under herdr, its process environment carries `HERDR_PANE_ID`,
@@ -167,7 +172,8 @@ macOS, treat `rooms_who` as advisory and confirm a lane with the multiplexer.
 | `rooms_dm` | Message one agent, or several by passing an array |
 | `rooms_reply_all` | Answer every recipient of a message you received |
 | `rooms_create` | Create a room with a fixed member list |
-| `rooms_join` | Join an existing room |
+| `rooms_join` | Join an existing room, or re-enter one you left |
+| `rooms_leave` | Leave a room: stop its traffic and discard your queue for it |
 | `rooms_post` | Post into a room |
 | `rooms_read` | Read room history, `since` a sequence number |
 | `rooms_list` | Rooms, members and post counts |
@@ -205,6 +211,50 @@ number you see is the line's position, which is why `since` is stable.
 `rooms_post` appends to the history and pushes a copy to every other member.
 Members who are not running receive nothing until they start; the history is
 still there for them.
+
+### Joining and leaving
+
+Membership is a **name test** against the room's `members` list. There is no join
+table and no session bookkeeping: a room is joinable by name whether or not any
+process currently holds that name.
+
+```text
+rooms_join({ room: "dxdb" })
+rooms_leave({ room: "dxdb" })                      // discards your queued posts for dxdb
+rooms_leave({ room: "dxdb", discardQueued: false })
+```
+
+**A join or a leave is history, not speech.** Both append a line to the room log
+with `kind: "event"`, which has no recipients: nobody is notified, no inbox file
+is written, and `rooms_read` shows it differently from a message.
+
+```text
+#11 09:41 dxdb-core: m2-core green
+#12 09:44 · dxdb-core left the room
+```
+
+Events occupy the same sequence numbers as messages, so a `since` cursor keeps
+working across them. Only a real membership change is recorded — a second
+`rooms_join` for a room you are already in is a no-op, and creating a room does
+not invent a join event for its creator.
+
+**`rooms_leave` discards your backlog by default**, because the point of parting
+is to stop spending context on that room. Queued-but-undelivered messages of
+yours whose `room` is the room you left are deleted, and the count is reported.
+Only your own inbox is touched, and only the queue — the `read/` archive kept for
+`reply_all`, messages for other rooms, and direct messages all survive. Message
+receipts are left alone too, so a discarded message honestly stays `queued` and
+never claims a delivery that did not happen. Pass `discardQueued: false` to keep
+the queue; those messages will still be delivered after you have left.
+
+**Re-entry does not replay.** `rooms_join` re-admits you, and posts made while you
+were out stay in the history for `rooms_read` — they are never re-queued into your
+inbox. Nothing is delivered to a non-member, so a post after your parting writes
+no inbox file for you at all.
+
+Direct messages are unaffected by room membership: a lane that has left a room is
+still reachable with `rooms_dm`. Leaving the last member is allowed — the room
+persists, empty and joinable, and its history stays readable.
 
 ### Reply all
 
@@ -257,7 +307,7 @@ not have one should leave it `null` and rely on delivery modes instead.
 <base>/receipts/<id>.json        per-recipient queued/delivered timestamps
 <base>/names.json                name pins (pane, session, cwd)
 <base>/rooms/<room>/room.json    members, creator
-<base>/rooms/<room>/log.jsonl    append-only history
+<base>/rooms/<room>/log.jsonl    append-only history, messages and membership events
 ```
 
 Presence is pruned by process liveness, so a killed lane disappears from the

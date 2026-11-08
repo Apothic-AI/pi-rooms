@@ -111,6 +111,12 @@ export interface RoomPost {
   sentAt: string;
   /** Members the post was fanned out to (everyone else in the room). */
   recipients: string[];
+  /**
+   * `message` (the default when absent, so older logs read the same) is speech
+   * by a member; `event` is room history that nobody said and nobody receives,
+   * such as a member joining or leaving.
+   */
+  kind?: "message" | "event";
 }
 
 export interface Paths {
@@ -711,6 +717,97 @@ export function readPosts(paths: Paths, room: string, since = 0, limit = 50): Nu
     posts.push({ ...parsed, seq });
   }
   return posts.length > limit ? posts.slice(posts.length - limit) : posts;
+}
+
+/**
+ * Add one member to a room, saving only when membership actually changes.
+ *
+ * Membership stays a name-string test against `members`: there is no join table,
+ * and a room is joinable by name whether or not any process currently holds it.
+ * Returns true when the name was added.
+ */
+export function addRoomMember(paths: Paths, room: Room, name: string): boolean {
+  if (!isValidName(name) || room.members.includes(name)) return false;
+  room.members = uniqueMembers([...room.members, name]);
+  saveRoom(paths, room);
+  return true;
+}
+
+/**
+ * Remove one member from a room, saving only when membership actually changes.
+ *
+ * Removing the last member is allowed and leaves the room file in place, so an
+ * empty room stays readable and stays joinable. Returns true when the name was
+ * removed.
+ */
+export function removeRoomMember(paths: Paths, room: Room, name: string): boolean {
+  if (!room.members.includes(name)) return false;
+  room.members = room.members.filter((member) => member !== name);
+  saveRoom(paths, room);
+  return true;
+}
+
+/** History text for the event recorded when a member joins a room. */
+export const JOIN_EVENT_TEXT = "joined the room";
+
+/** History text for the event recorded when a member leaves a room. */
+export const LEAVE_EVENT_TEXT = "left the room";
+
+/**
+ * Append a membership event to the room history.
+ *
+ * An event is a post with `kind: "event"` and **no recipients**: it is history,
+ * not speech, so nothing is delivered and no inbox file is written. It occupies
+ * a sequence number like any other line, which keeps every reader's `since`
+ * cursor working across it.
+ */
+export function appendRoomEvent(paths: Paths, room: string, from: string, text: string): number {
+  return appendPost(paths, room, {
+    kind: "event",
+    from,
+    text,
+    sentAt: new Date().toISOString(),
+    recipients: [],
+  });
+}
+
+/**
+ * Delete one agent's still-queued messages for one room, returning how many.
+ *
+ * Only that agent's own inbox is read, non-recursively, so the `read/` archive
+ * kept for `reply_all` is untouched: a message is queued exactly while it sits
+ * as a file directly in the inbox. Messages for other rooms and direct messages
+ * (`room` absent) are left alone.
+ *
+ * Receipts are deliberately not rewritten. A discarded message was honestly
+ * queued and never delivered, and a receipt claiming otherwise would be a lie
+ * about what the extension observed; `queued` is the true end state.
+ */
+export function discardQueuedRoomMessages(paths: Paths, name: string, room: string): number {
+  const dir = inboxDir(paths, name);
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const file = path.join(dir, entry.name);
+    const message = readJson<Delivery>(file);
+    // A file that will not parse is not a message anyone can act on; leave it to
+    // the drain, which already clears those.
+    if (message == null) continue;
+    if (message.room !== room || message.deliveredAt != null) continue;
+    try {
+      fs.unlinkSync(file);
+      removed += 1;
+    } catch {
+      /* another process drained it first */
+    }
+  }
+  return removed;
 }
 
 export function uniqueMembers(members: readonly string[]): string[] {

@@ -19,16 +19,21 @@ import { Type } from "typebox";
 import { loadConfig, type RoomsConfig } from "./src/config.ts";
 import {
   archive,
+  addRoomMember,
   appendPost,
+  appendRoomEvent,
   bootId,
   claimName,
   createRoom,
   defaultName,
   deliver,
+  discardQueuedRoomMessages,
   drain,
   findReceived,
   isValidName,
   isValidRoom,
+  JOIN_EVENT_TEXT,
+  LEAVE_EVENT_TEXT,
   listAgents,
   listRooms,
   procIdentity,
@@ -38,11 +43,11 @@ import {
   readRoom,
   readRoster,
   register,
+  removeRoomMember,
   resolveBase,
   resolvePaths,
   roomSeq,
   sanitize,
-  saveRoom,
   slugify,
   unregister,
   uniqueMembers,
@@ -644,7 +649,9 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "rooms_join",
     label: "Rooms: join",
-    description: "Join an existing room so you receive its posts.",
+    description:
+      "Join an existing room so you receive its posts. Joining is also how you re-enter a room you left: " +
+      "you are re-admitted, but posts made while you were out are not replayed — read them with rooms_read.",
     parameters: Type.Object({
       room: Type.String({ description: "Room name" }),
     }),
@@ -653,11 +660,71 @@ export default function (pi: ExtensionAPI): void {
       const name = slugify(params.room);
       const room = readRoom(active.paths, name);
       if (room == null) return fail(`Room ${name} does not exist.`);
+      // Only a real membership change is history: a repeated join is a no-op and
+      // must not fill the log with duplicate events.
+      const joined = addRoomMember(active.paths, room, active.name);
+      const seq = joined ? appendRoomEvent(active.paths, name, active.name, JOIN_EVENT_TEXT) : null;
+      return text(
+        `Joined room ${name} (${room.members.length} members): ${room.members.join(", ")}.` +
+          (seq != null
+            ? `\nRecorded at #${seq}. Posts made before you joined are in the history, not in your inbox.`
+            : `\nYou were already a member; nothing changed.`),
+        { room, joined, seq },
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "rooms_leave",
+    label: "Rooms: leave",
+    description:
+      "Leave a room: you stop receiving its posts, and they stop being queued for you. " +
+      "The parting is appended to the room history as an event (nobody is notified), and by default your " +
+      "own queued-but-undelivered messages for that room are discarded so no backlog survives the part. " +
+      "Discarding leaves message receipts alone, so a discarded message honestly stays `queued`. " +
+      "Re-enter with rooms_join; posts made while you were out are not replayed. Direct messages are " +
+      "unaffected, and leaving the last member leaves the room in place, empty and joinable.",
+    parameters: Type.Object({
+      room: Type.String({ description: "Room name" }),
+      discardQueued: Type.Optional(
+        Type.Boolean({
+          description:
+            "Delete your queued, undelivered messages for this room (default true). false keeps them, so " +
+            "they will still be delivered after you have left.",
+        }),
+      ),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const active = join(ctx);
+      const name = slugify(params.room);
+      const room = readRoom(active.paths, name);
+      if (room == null) return fail(`Room ${name} does not exist.`);
       if (!room.members.includes(active.name)) {
-        room.members = uniqueMembers([...room.members, active.name]);
-        saveRoom(active.paths, room);
+        // Idempotent: being out already is the state the caller asked for.
+        return text(`You are not a member of ${name}: nothing to leave.`, {
+          room: name,
+          left: false,
+          discarded: 0,
+          members: room.members,
+        });
       }
-      return text(`Joined room ${name} (${room.members.length} members): ${room.members.join(", ")}.`, { room });
+      removeRoomMember(active.paths, room, active.name);
+      const seq = appendRoomEvent(active.paths, name, active.name, LEAVE_EVENT_TEXT);
+      const discardQueued = params.discardQueued !== false;
+      const discarded = discardQueued
+        ? discardQueuedRoomMessages(active.paths, active.name, name)
+        : 0;
+      const remaining = room.members;
+      return text(
+        `Left room ${name} at #${seq}. It now has ${remaining.length} member(s)` +
+          `${remaining.length > 0 ? `: ${remaining.join(", ")}` : " and stays joinable"}.` +
+          (discardQueued
+            ? `\nDiscarded ${discarded} queued message(s) of yours for this room.`
+            : `\nKept your queued messages for this room (discardQueued:false); they will still be delivered.`) +
+          `\nYou receive no further posts here. Re-enter with rooms_join({room:"${name}"}); ` +
+          `posts made while you were out are not replayed.`,
+        { room: name, left: true, seq, discarded, members: remaining },
+      );
     },
   });
 
@@ -710,7 +777,8 @@ export default function (pi: ExtensionAPI): void {
     label: "Rooms: read history",
     description:
       "Read a room's history, oldest first, numbered by position. Pass `since` with the last number you saw to " +
-      "fetch only what is new. This is how a late joiner catches up on a room.",
+      "fetch only what is new. This is how a late joiner catches up on a room. Membership events (joining and " +
+      "leaving) appear in the same numbering, marked `· name joined the room`.",
     parameters: Type.Object({
       room: Type.String({ description: "Room name" }),
       since: Type.Optional(Type.Number({ description: "Return posts after this number (default: from the start)" })),
@@ -731,7 +799,11 @@ export default function (pi: ExtensionAPI): void {
           { room: name, posts: [], total },
         );
       }
-      const lines = posts.map((p) => `#${p.seq} ${shortTime(p.sentAt)} ${p.from}: ${p.text}`);
+      const lines = posts.map((p) =>
+        p.kind === "event"
+          ? `#${p.seq} ${shortTime(p.sentAt)} · ${p.from} ${p.text}`
+          : `#${p.seq} ${shortTime(p.sentAt)} ${p.from}: ${p.text}`,
+      );
       return text(
         `Room ${name} · ${room.members.length} members · showing #${posts[0].seq}-#${posts[posts.length - 1].seq}\n` +
           lines.join("\n"),
