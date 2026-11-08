@@ -124,9 +124,12 @@ When it does proceed, it names the rooms left behind. So the order that avoids t
 problem entirely is: **pin first, then create rooms over the lane.** A rename is
 only safe before a lane has joined anything.
 
-A rename is therefore an *implicit* parting: it drops the old name out of the room
-without appending an event and without discarding that name's queue. To part
-loudly — with a history event and a clean queue — use `rooms_leave` first. See
+A rename is therefore an *implicit* parting, and a messy one: the lane stops
+answering to the old name, but the old name is **not** removed from `room.json`.
+The room keeps listing it, keeps queueing posts into an inbox nobody drains, and
+appends no event saying it happened. `rooms_leave` is the explicit exit: it takes
+the name out of the room, records the event, and clears that name's queue. So the
+order that leaves nothing behind is **`rooms_leave`, then rename**. See
 [Joining and leaving](#joining-and-leaving).
 
 ### Correlating a name with a pane

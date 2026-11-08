@@ -553,3 +553,60 @@ test("rooms_join records an event only when membership actually changes", async 
   assert.equal(roomSeq(paths, "j"), 1);
   assert.deepEqual(readPosts(paths, "j").map((p) => `${p.seq}:${p.kind}:${p.from}`), ["1:event:core"]);
 });
+
+test("a parted lane cannot speak into the room through rooms_reply_all", async () => {
+  const dir = base();
+  const paths = resolvePaths(dir);
+  const lead = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "lead" });
+  await call(lead, "rooms_create", { room: "ft24", members: ["core"] }, "/work/x");
+  await call(lead, "rooms_post", { room: "ft24", message: "before you go" }, "/work/x");
+
+  // Stand in for the watcher: the post is in core's read/ archive, which is what
+  // reply_all searches. Holding the message is what makes this reachable at all.
+  const delivered = drain(paths, "core").find((entry) => entry.message.room === "ft24")!;
+  archive(paths, "core", delivered.file, delivered.message);
+
+  const core = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "core" });
+  await call(core, "rooms_leave", { room: "ft24" }, "/work/x");
+  const seqBefore = roomSeq(paths, "ft24");
+  const inboxBefore = drain(paths, "lead").length;
+
+  as("core");
+  const reply = await call(core, "rooms_reply_all", { messageId: delivered.message.id, message: "still here" }, "/work/x");
+  assert.equal(reply.isError, true, "leaving must close the room's speech, not only its traffic");
+  assert.match(reply.content[0].text, /You are not a member of ft24/);
+  assert.equal(roomSeq(paths, "ft24"), seqBefore, "no post reached the room log");
+  assert.equal(drain(paths, "lead").length, inboxBefore, "no member was queued anything");
+
+  // rooms_post already refuses the same lane: the two doors now agree.
+  const post = await call(core, "rooms_post", { room: "ft24", message: "still here" }, "/work/x");
+  assert.equal(post.isError, true);
+});
+
+test("a lane that never joined cannot reply into a room it holds a message from", async () => {
+  const dir = base();
+  const paths = resolvePaths(dir);
+  const lead = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "lead" });
+  await call(lead, "rooms_create", { room: "ft24", members: ["core"] }, "/work/x");
+  await call(lead, "rooms_post", { room: "ft24", message: "cc'd" }, "/work/x");
+
+  // Someone hands the outsider a copy of the room post (a future recipient list
+  // could do this; today's tools do not), so the message is not the admission.
+  const queued = drain(paths, "core").find((entry) => entry.message.room === "ft24")!;
+  const { deliver } = await import("../src/store.ts");
+  deliver(paths, { ...queued.message, id: "99999999-9999-9999-9999-999999999999", to: ["outsider"] });
+  const forOutsider = drain(paths, "outsider")[0]!;
+  archive(paths, "outsider", forOutsider.file, forOutsider.message);
+
+  const outsider = loadExtension({ PI_ROOMS_DIR: dir, PI_ROOMS_NAME: "outsider" });
+  const seqBefore = roomSeq(paths, "ft24");
+  const reply = await call(
+    outsider,
+    "rooms_reply_all",
+    { messageId: "99999999-9999-9999-9999-999999999999", message: "butting in" },
+    "/work/x",
+  );
+  assert.equal(reply.isError, true);
+  assert.match(reply.content[0].text, /You are not a member of ft24/);
+  assert.equal(roomSeq(paths, "ft24"), seqBefore);
+});

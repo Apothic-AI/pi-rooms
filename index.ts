@@ -559,6 +559,20 @@ export default function (pi: ExtensionAPI): void {
             `or use rooms_dm with explicit recipients.`,
         );
       }
+      // A room message can only be answered by a member. Leaving has to be an exit
+      // from the room's speech as well as its traffic, and membership — not holding
+      // an old copy of the message — is what decides that. rooms_post already
+      // refuses a non-member; this is the same door.
+      if (original.room != null) {
+        const membership = readRoom(active.paths, original.room);
+        if (membership == null) return fail(`Room ${original.room} no longer exists.`);
+        if (!membership.members.includes(active.name)) {
+          return fail(
+            `You are not a member of ${original.room}, so it does not accept this reply. Re-enter with ` +
+              `rooms_join({room:"${original.room}"}), or answer ${original.from} directly with rooms_dm.`,
+          );
+        }
+      }
       const over = spendBudget(active);
       if (over != null) return fail(over);
       const body = sanitize(params.message);
