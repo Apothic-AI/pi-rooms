@@ -39,7 +39,8 @@ import {
   procIdentity,
   readPosts,
   readRegistration,
-  receiptPathFor,
+  receiptDirFor,
+  consolidateReceipts,
   readRoom,
   readRoster,
   register,
@@ -65,6 +66,12 @@ interface SessionState {
   sendsUsed: number;
   watcher: fs.FSWatcher | null;
   poller: NodeJS.Timeout | null;
+  /** Pending follow-up flush for a bounded batch that had a remainder. */
+  continuation: NodeJS.Timeout | null;
+  /** Inbox the pending continuation drains, so a takeover can cancel it. */
+  continuationName: string | null;
+  /** Inboxes of names this session has left, still being drained for a grace window. */
+  grace: Map<string, { timer: NodeJS.Timeout; stop: NodeJS.Timeout; until: number }>;
   draining: boolean;
   /** Pin key the current name came from, when it came from a pin. */
   pinKey: string | null;
@@ -90,6 +97,41 @@ function nowIso(): string {
 function shortTime(iso: string): string {
   return iso.slice(11, 16);
 }
+
+/** Milliseconds between a queue stamp and now, or null when it cannot be read. */
+function ageOf(iso: string | undefined): number | null {
+  if (iso == null) return null;
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return null;
+  return Math.max(0, Date.now() - then);
+}
+
+/** Coarse, human-readable age: "6h 12m". Used in stale prefixes. */
+function formatAge(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${seconds}s`;
+}
+
+/** Delay before continuing a bounded flush, so a burst does not wait for the poller. */
+const CONTINUATION_MS = 250;
+
+/**
+ * How long a renamed lane keeps draining the inbox it left behind.
+ *
+ * A rename is not an identity change: peers that have not noticed it yet keep
+ * addressing the old name, and `deliver()` queues for any valid name whether or
+ * not a session holds it. Without this window those messages land in an inbox no
+ * watcher points at and are never delivered or receipted. Bounded, so a name that
+ * is genuinely retired does not stay half-alive forever.
+ */
+const RENAME_GRACE_MS = 120_000;
+const RENAME_GRACE_INTERVAL_MS = 1_000;
 
 /** Normalise the `to` parameter, which accepts one name or a list. */
 function toList(value: string | string[]): string[] {
@@ -143,7 +185,11 @@ export default function (pi: ExtensionAPI): void {
 
   function ensure(ctx: ExtensionContext): SessionState {
     if (session != null) {
+      const previous = session.name;
       refreshName(session, ctx.cwd);
+      // A pin can rename a running lane on its next tool call; the watcher has to
+      // follow it or the lane goes deaf to its own inbox.
+      if (session.name !== previous) rebindWatcher(session, ctx, previous);
       return session;
     }
     const paths = resolvePaths(resolveBase());
@@ -157,6 +203,9 @@ export default function (pi: ExtensionAPI): void {
       sendsUsed: 0,
       watcher: null,
       poller: null,
+      continuation: null,
+      continuationName: null,
+      grace: new Map(),
       draining: false,
       pinKey: null,
       paneId: nonEmpty(process.env.HERDR_PANE_ID),
@@ -242,7 +291,7 @@ export default function (pi: ExtensionAPI): void {
   // Delivery
   // -------------------------------------------------------------------------
 
-  function render(message: Delivery): string {
+  function render(message: Delivery, staleAfterMs = Number.POSITIVE_INFINITY): string {
     const header =
       message.room != null
         ? `[room ${message.room}${message.roomSeq != null ? ` #${message.roomSeq}` : ""}] ${message.from}`
@@ -253,46 +302,172 @@ export default function (pi: ExtensionAPI): void {
         ? `read: rooms_read({room:"${message.room}", since:${message.roomSeq ?? 0}})`
         : `reply: rooms_dm({to:"${message.from}"}) · reply to all: rooms_reply_all({messageId:"${message.id}"})`,
     ];
-    return `${header} · ${hints.join(" · ")}\n\n${message.text}`;
+    // A message that waited a long time must never arrive looking like fresh
+    // conversation: the age is part of the message, not a detail the model has to
+    // infer from a stamp it cannot see.
+    const age = ageOf(message.queuedAt ?? message.sentAt);
+    const stale = age != null && age >= staleAfterMs ? `[stale · queued ${formatAge(age)} ago]\n` : "";
+    return `${stale}${header} · ${hints.join(" · ")}\n\n${message.text}`;
   }
 
-  function flush(context: ExtensionContext): void {
+
+  /**
+   * Whether this name's inbox may be drained right now.
+   *
+   * The session's own inbox always may. An inbox it has left — a rename — may only
+   * be drained while that grace window is open *and* no other live agent holds the
+   * name: from the moment another process answers to it, the inbox is theirs, and
+   * delivering (and archiving) from it would steal their mail.
+   *
+   * Every old-inbox drain goes through this, immediately before it runs. Checking
+   * once when the window opens is not enough: a bounded batch leaves a continuation
+   * queued behind it, and a takeover can happen in that gap.
+   */
+  function canDrain(active: SessionState, name: string): boolean {
+    if (name === active.name) return true;
+    const grace = active.grace.get(name);
+    if (grace == null || Date.now() >= grace.until) return false;
+    return !listAgents(active.paths).some((agent) => agent.name === name && agent.pid !== process.pid);
+  }
+
+  /**
+   * Hand the queued messages to this session.
+   *
+   * Two rules keep a catch-up from derailing the turn it lands in:
+   *
+   * 1. bounded — at most `maxDeliverPerFlush` transcripts per tick, the rest stay
+   *    queued for the next one, in arrival order, and a short continuation picks
+   *    them up rather than waiting for the poll interval;
+   * 2. one wake — only the first handoff of a flush asks for a turn, so an idle
+   *    lane is woken once per batch instead of once per message.
+   *
+   * There is deliberately no "digest" that summarises a backlog into one line.
+   * A digest cannot be lossless: a direct message has no read tool (`rooms_read`
+   * is rooms-only, `rooms_dm` only sends), so summarising a DM would archive it as
+   * delivered while its body became unreachable. Every message here is therefore
+   * handed over in full, marked with its age when it is old.
+   *
+   * `nameOverride` drains another inbox once, which is what a rename needs: the
+   * inbox the session is leaving behind must not keep a queue nobody will read.
+   * That drain, and any continuation behind it, is refused the moment another live
+   * agent holds the name — see {@link canDrain}.
+   */
+  /**
+   * Give up on an inbox this session has left.
+   *
+   * Called the moment any old-inbox path observes that the name is no longer ours —
+   * a live holder, or a closed window. Closing the window here, rather than waiting
+   * for the next interval tick to notice independently, is what stops a holder who
+   * appears and disappears inside one tick from re-opening delivery: the interval
+   * and the continuation both go with the window.
+   */
+  function abandonOldDrain(active: SessionState, name: string): void {
+    if (name === active.name) return;
+    stopGraceDrain(active, name);
+  }
+
+  function flush(context: ExtensionContext, nameOverride?: string): void {
     const active = session;
     if (active == null || active.draining) return;
+    const name = nameOverride ?? active.name;
+    if (!canDrain(active, name)) {
+      abandonOldDrain(active, name);
+      return;
+    }
     active.draining = true;
+    let more = false;
+    let lostName = false;
     try {
-      const pending = drain(active.paths, active.name);
-      for (const entry of pending) {
+      const pending = drain(active.paths, name);
+      if (pending.length === 0) return;
+      const injectedAt = nowIso();
+      const batch = pending.slice(0, active.config.maxDeliverPerFlush);
+      more = pending.length > batch.length;
+      for (const [index, entry] of batch.entries()) {
+        // Re-checked before *every* handoff, not once per batch: a claim can land
+        // while this batch is running, and the rest of the batch is that holder's
+        // mail from that moment on. What was already handed over keeps its receipt
+        // and archive; the untouched remainder is left in the inbox.
+        if (!canDrain(active, name)) {
+          abandonOldDrain(active, name);
+          lostName = true;
+          break;
+        }
         const isRoom = entry.message.room != null;
         pi.sendMessage(
           {
             customType: "pi_rooms_message",
-            content: render(entry.message),
+            content: render(entry.message, active.config.staleAfterMs),
             display: true,
             details: entry.message,
           },
           {
-            triggerTurn: true,
+            triggerTurn: index === 0,
             deliverAs: isRoom ? active.config.roomDelivery : active.config.dmDelivery,
           },
         );
         // archive stamps deliveredAt and writes the receipt; it runs after the
         // handoff so a crash between the two reports "queued" rather than a
-        // delivery that never happened.
-        archive(active.paths, active.name, entry.file, entry.message);
+        // delivery that never happened. injectedAt records that this flush is the
+        // one that handed it over.
+        archive(active.paths, name, entry.file, entry.message, { injectedAt });
       }
     } catch {
       /* a failed flush must not break the session; the next tick retries */
     } finally {
       active.draining = false;
     }
-    void context;
+    // A lost name is not a remainder: nothing may be scheduled to drain it again.
+    if (more && !lostName) scheduleNextFlush(context, name);
   }
 
-  function startWatcher(context: ExtensionContext): void {
+  /**
+   * Continue a bounded flush shortly after it stopped, rather than waiting for the
+   * poller: a burst of 20 messages should not take 8 poll intervals to arrive.
+   *
+   * The eligibility check is repeated here and again inside the timer, because a
+   * takeover can land between scheduling and firing.
+   */
+  function scheduleNextFlush(context: ExtensionContext, name: string): void {
     const active = session;
-    if (active == null || active.watcher != null) return;
-    const dir = path.join(active.paths.inbox, active.name);
+    if (active == null || active.continuation != null) return;
+    if (!canDrain(active, name)) {
+      abandonOldDrain(active, name);
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (active.continuation === timer) {
+        active.continuation = null;
+        active.continuationName = null;
+      }
+      if (session !== active) return;
+      if (!canDrain(active, name)) {
+        abandonOldDrain(active, name);
+        return;
+      }
+      flush(context, name === active.name ? undefined : name);
+    }, CONTINUATION_MS);
+    timer.unref();
+    active.continuation = timer;
+    active.continuationName = name;
+  }
+
+  /** Drop a queued continuation, for one name when given, or for any. */
+  function cancelContinuation(active: SessionState, name?: string): void {
+    if (active.continuation == null) return;
+    if (name != null && active.continuationName !== name) return;
+    clearTimeout(active.continuation);
+    active.continuation = null;
+    active.continuationName = null;
+  }
+
+  function watchDirFor(active: SessionState): string {
+    return path.join(active.paths.inbox, active.name);
+  }
+
+  /** Bind the watcher and poller to the current name's inbox. */
+  function openWatcher(active: SessionState, context: ExtensionContext): void {
+    const dir = watchDirFor(active);
     try {
       fs.mkdirSync(dir, { recursive: true });
       let timer: NodeJS.Timeout | null = null;
@@ -314,13 +489,86 @@ export default function (pi: ExtensionAPI): void {
     active.poller.unref();
   }
 
-  function stopWatcher(): void {
+  function startWatcher(context: ExtensionContext): void {
     const active = session;
-    if (active == null) return;
+    if (active == null || active.watcher != null) return;
+    openWatcher(active, context);
+  }
+
+  function closeWatcher(active: SessionState): void {
     active.watcher?.close();
     active.watcher = null;
     if (active.poller != null) clearInterval(active.poller);
     active.poller = null;
+    cancelContinuation(active);
+    for (const { timer, stop } of active.grace.values()) {
+      clearInterval(timer);
+      clearTimeout(stop);
+    }
+    active.grace.clear();
+  }
+
+  /**
+   * Keep draining an inbox this session has left, for a bounded window.
+   *
+   * Only messages that arrive *after* the rebind need this: the one-off drain in
+   * {@link rebindWatcher} covers the backlog. The window closes on time, when the
+   * session ends, or when another live agent takes the name — and closing it also
+   * drops any continuation still queued behind a batch.
+   */
+  function startGraceDrain(active: SessionState, context: ExtensionContext, name: string): void {
+    const existing = active.grace.get(name);
+    if (existing != null) {
+      clearInterval(existing.timer);
+      clearTimeout(existing.stop);
+    }
+    const timer = setInterval(() => {
+      if (session !== active || !canDrain(active, name)) {
+        abandonOldDrain(active, name);
+        return;
+      }
+      flush(context, name);
+    }, RENAME_GRACE_INTERVAL_MS);
+    timer.unref();
+    const stop = setTimeout(() => stopGraceDrain(active, name), RENAME_GRACE_MS);
+    stop.unref();
+    active.grace.set(name, { timer, stop, until: Date.now() + RENAME_GRACE_MS });
+  }
+
+  function stopGraceDrain(active: SessionState, name: string): void {
+    const entry = active.grace.get(name);
+    if (entry == null) return;
+    clearInterval(entry.timer);
+    clearTimeout(entry.stop);
+    active.grace.delete(name);
+    // A stopped window must not be finished off by a continuation queued while it
+    // was still open.
+    cancelContinuation(active, name);
+  }
+
+  function stopWatcher(): void {
+    const active = session;
+    if (active == null) return;
+    closeWatcher(active);
+  }
+
+  /**
+   * Follow a name change.
+   *
+   * The watcher is bound to one directory, so a rename that only updated the name
+   * would leave this lane watching an inbox nobody writes to — served by the 2s
+   * poller at best — while the old inbox kept collecting messages this session no
+   * longer answers to. Rebinding drains the inbox being left behind once, and a
+   * bounded grace drain keeps taking mail that is still addressed to the old name.
+   */
+  function rebindWatcher(active: SessionState, context: ExtensionContext, previousName: string): void {
+    closeWatcher(active);
+    openWatcher(active, context);
+    if (previousName === active.name) return;
+    // Open the window first, so the one-off backlog drain below already has one to
+    // be judged against by canDrain().
+    startGraceDrain(active, context, previousName);
+    flush(context, previousName);
   }
 
   // -------------------------------------------------------------------------
@@ -488,7 +736,9 @@ export default function (pi: ExtensionAPI): void {
         (active.sessionId != null && key === `session:${active.sessionId}`) ||
         (active.paneId != null && key === `pane:${active.paneId}`);
       if (appliesHere) {
+        const previous = active.name;
         refreshName(active, ctx.cwd);
+        if (active.name !== previous) rebindWatcher(active, ctx, previous);
         join(ctx);
       }
 
@@ -499,6 +749,35 @@ export default function (pi: ExtensionAPI): void {
             : ` It applies on that lane's next tool call.`) +
           (rooms.length > 0 && wanted !== active.name ? ` Left rooms: ${rooms.map((r) => r.name).join(", ")}.` : ""),
         { key, name: wanted, appliedHere: appliesHere, leftRooms: rooms.map((r) => r.name) },
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "rooms_receipts",
+    label: "Rooms: receipts",
+    description:
+      "Receipt maintenance. `consolidate` folds the per-recipient receipt files back into the legacy " +
+      "single-file layout (`<base>/receipts/<id>.json`), which is the rollback step for a build that only " +
+      "understands that layout — without it, every message it delivered reads as still queued. It merges " +
+      "into the existing record instead of replacing it, and running it twice changes nothing. " +
+      "Delivery is unaffected: it only writes receipts.",
+    parameters: Type.Object({
+      action: Type.Optional(
+        Type.Union([Type.Literal("consolidate")], {
+          description: "Defaults to consolidate; the only action today",
+        }),
+      ),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const active = ensure(ctx);
+      void params;
+      const result = consolidateReceipts(active.paths);
+      return text(
+        `Consolidated ${result.messages} message(s), ${result.recipients} new recipient receipt(s) ` +
+          `into ${active.paths.receipts}/<id>.json.\n` +
+          `Safe to repeat; a build that only reads the legacy layout now sees these receipts.`,
+        result,
       );
     },
   });
@@ -534,7 +813,7 @@ export default function (pi: ExtensionAPI): void {
       return text(
         `Queued to ${written.length} agent(s)${missing.length > 0 ? `; skipped ${missing.join(", ")}` : ""}. id ${message.id}\n` +
           `Queued is not delivered: each recipient's session records a deliveredAt when it is handed the message. ` +
-          `The receipt file is ${receiptPathFor(active.paths, message.id)}.`,
+          `The receipts are per recipient under ${receiptDirFor(active.paths, message.id)}/.`,
         { id: message.id, delivered: written, skipped: missing },
       );
     },

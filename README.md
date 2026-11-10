@@ -132,6 +132,14 @@ the name out of the room, records the event, and clears that name's queue. So th
 order that leaves nothing behind is **`rooms_leave`, then rename**. See
 [Joining and leaving](#joining-and-leaving).
 
+The lane itself does not strand direct mail across a rename: it drains the inbox
+it is leaving once, and then keeps draining it for two minutes, so a peer that has
+not noticed the rename still reaches it and the message is receipted against the
+name it was addressed to. That window is bounded, and it stops early if another
+live agent takes the old name — from that moment the inbox is theirs. It does not
+extend to rooms: a room still listing the old name keeps queueing to it, and only
+`rooms_leave` or a re-join under the new name fixes that.
+
 ### Correlating a name with a pane
 
 When pi runs under herdr, its process environment carries `HERDR_PANE_ID`,
@@ -181,16 +189,29 @@ macOS, treat `rooms_who` as advisory and confirm a lane with the multiplexer.
 | `rooms_read` | Read room history, `since` a sequence number |
 | `rooms_list` | Rooms, members and post counts |
 | `rooms_pins` | List, set and remove name pins; refuses a rename that leaves rooms |
+| `rooms_receipts` | Receipt maintenance: `consolidate` folds per-recipient receipts back for a rollback |
 
 ### Delivery status
 
-Every message gets a receipt file at `<base>/receipts/<message-id>.json`, recording
-what the extension could actually observe:
+Every message gets one receipt per recipient at
+`<base>/receipts/<message-id>/<recipient>.json`, recording what the extension could
+actually observe:
 
 - **`queuedAt`** — the recipient's inbox accepted the message. `rooms_dm` reports
   this the moment it returns.
 - **`deliveredAt`** — the recipient's own session was handed the message through
-  `pi.sendMessage`. This is the last moment the extension can see anything.
+  `pi.sendMessage`, and the message is archived as delivered only after that handoff.
+  This is the last moment the extension can see anything.
+- **`injectedAt`** — the handoff the flush made, recorded alongside `deliveredAt`.
+  It is the same observation, kept separate for diagnosis; neither field is a
+  state of its own.
+
+A receipt is written per recipient, under a short lock, because several sessions
+archiving the same message at once used to overwrite one shared file and lose
+`deliveredAt` — a delivered message that read as `queued` forever. Builds before
+this layout kept one file per message, `<base>/receipts/<message-id>.json`; those
+are still read and merged, and `rooms_receipts({action:"consolidate"})` writes the
+old layout back if you need to roll back to such a build.
 
 There is deliberately **no read or acknowledged state**. The extension cannot see
 what a model does with a message once its session holds it, and a receipt that
@@ -284,7 +305,9 @@ the room instead, so the answer lands in the history.
   "maxSendsPerSession": null,
   "dmDelivery": "steer",
   "roomDelivery": "followUp",
-  "pollMs": 2000
+  "pollMs": 2000,
+  "maxDeliverPerFlush": 5,
+  "staleAfterMs": 900000
 }
 ```
 
@@ -295,6 +318,13 @@ the room instead, so the answer lands in the history.
 | `dmDelivery` | `"steer"` | A DM interrupts the receiver now |
 | `roomDelivery` | `"followUp"` | A room post is delivered when the receiver is idle |
 | `pollMs` | `2000` | Inbox fallback poll, for filesystems where `watch` is unreliable |
+| `maxDeliverPerFlush` | `5` | Most messages handed to a session per tick. The rest stay queued, in arrival order, and follow on the next tick — a lane coming back from a long turn is not injected with the whole backlog at once. Only the first message of each tick asks for a turn |
+| `staleAfterMs` | `900000` | Messages queued longer than this (15 min) are rendered with an explicit age prefix, so a catch-up cannot read as fresh conversation |
+
+There is no summary mode: every queued message is handed over in full. A digest
+would have to archive a body nothing can fetch back — `rooms_read` covers rooms
+only, and there is no tool that reads a direct message — so bounding is the only
+mechanism here, and the age prefix is the only compression.
 
 The send cap is off by default and is structural when on: it is enforced on the
 only path that can send, so an agent cannot route around it. A cap is the
@@ -307,7 +337,9 @@ not have one should leave it `null` and rely on delivery modes instead.
 <base>/registry/<name>.json      presence: name, pid, proc identity, pane, cwd, model
 <base>/inbox/<name>/*.json       undelivered messages
 <base>/inbox/<name>/read/*.json  delivered messages, kept for reply_all lookup
-<base>/receipts/<id>.json        per-recipient queued/delivered timestamps
+<base>/receipts/<id>/<recipient>.json  one receipt per recipient: queued/delivered/injected stamps
+<base>/receipts/<id>.json             pre-migration single-file receipt, still read
+<base>/receipts/<id>/<recipient>.json.lock  held for the duration of one receipt write
 <base>/names.json                name pins (pane, session, cwd)
 <base>/rooms/<room>/room.json    members, creator
 <base>/rooms/<room>/log.jsonl    append-only history, messages and membership events

@@ -72,6 +72,15 @@ export interface Delivery {
   queuedAt?: string;
   /** When the recipient's session was handed the message. Set by `archive`. */
   deliveredAt?: string;
+  /**
+   * When the extension handed the message to `pi.sendMessage`.
+   *
+   * Additive to `deliveredAt`, and deliberately not a state of its own: it is the
+   * same handoff, recorded by the flush that made it. `deliveredAt` remains the
+   * receipt field that says "this session was handed the message"; neither field
+   * proves the model read it, and nothing in this store ever claims that.
+   */
+  injectedAt?: string;
   /** Recipients whose inbox accepted the message, with the per-recipient queue time. */
   receipts?: Record<string, Receipt>;
   /** Set when the message was posted into a room. */
@@ -94,6 +103,11 @@ export interface Delivery {
 export interface Receipt {
   queuedAt: string;
   deliveredAt?: string;
+  /**
+   * When the recipient's session was handed the message, copied from the flush
+   * that did it. Additive to `deliveredAt`; see {@link Delivery.injectedAt}.
+   */
+  injectedAt?: string;
 }
 
 export interface Room {
@@ -454,8 +468,9 @@ export interface PendingMessage {
 /**
  * Write one delivery into every recipient's inbox. The sender's own box is skipped.
  *
- * Each copy records its own `queuedAt`, and the shared receipt file is updated
- * so the sender can later ask what the extension observed.
+ * Each copy records its own `queuedAt`, and that recipient's receipt file is
+ * updated under its lock, so the sender can later ask what the extension
+ * observed for each of them.
  */
 export function deliver(paths: Paths, message: Delivery): string[] {
   const written: string[] = [];
@@ -474,27 +489,122 @@ export function deliver(paths: Paths, message: Delivery): string[] {
 }
 
 function receiptPath(paths: Paths, id: string): string {
+  // The pre-split layout: one file per message holding every recipient. Kept for
+  // reading only, so existing receipts stay visible after the migration.
   return path.join(paths.receipts, `${id}.json`);
 }
 
-/** Where a message's receipt file lives, for callers that report it to a human. */
-export function receiptPathFor(paths: Paths, id: string): string {
-  return receiptPath(paths, id);
+/** Directory holding one receipt file per recipient, for callers that show a path. */
+export function receiptDirFor(paths: Paths, id: string): string {
+  return path.join(paths.receipts, id);
 }
 
+function recipientReceiptPath(paths: Paths, id: string, recipient: string): string {
+  return path.join(receiptDirFor(paths, id), `${recipient}.json`);
+}
+
+/** One recipient's entry from the pre-split single-file layout, if it had one. */
+function legacyReceiptFor(paths: Paths, id: string, recipient: string): Receipt | null {
+  const legacy = readJson<ReceiptRecord>(receiptPath(paths, id));
+  return legacy?.receipts?.[recipient] ?? null;
+}
+
+/**
+ * Block the thread briefly. Used only while waiting for a receipt lock, where the
+ * holder is another process doing a handful of syscalls.
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+const LOCK_ATTEMPTS = 400;
+const LOCK_WAIT_MS = 1;
+/** A lock this old was left behind by a writer that died mid-write. */
+const LOCK_STALE_MS = 2000;
+
+/**
+ * Run `fn` holding an exclusive lock on one receipt file.
+ *
+ * `mkdir` is the lock: it either creates the directory or fails with EEXIST, and
+ * that is atomic on every platform this runs on. It is held for three syscalls,
+ * so contention is short; a lock older than {@link LOCK_STALE_MS} is reclaimed so
+ * a killed process cannot wedge a recipient's receipts.
+ */
+function withReceiptLock(file: string, fn: () => void): void {
+  const lock = `${file}.lock`;
+  let held = false;
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
+    try {
+      fs.mkdirSync(lock);
+      held = true;
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw new Error(
+          `pi-rooms: cannot create the receipt lock ${lock} (${(error as NodeJS.ErrnoException).code ?? String(error)}); ` +
+            `refusing to write ${file} unprotected`,
+        );
+      }
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS) {
+          fs.rmdirSync(lock);
+          continue;
+        }
+      } catch {
+        /* the holder released it between the mkdir and the stat */
+      }
+      sleepSync(LOCK_WAIT_MS);
+    }
+  }
+  if (!held) {
+    // Fail closed. Writing without the lock is the read-modify-write this lock
+    // exists to prevent, and doing it silently would trade a visible failure for
+    // a receipt that quietly loses a field.
+    throw new Error(
+      `pi-rooms: could not lock ${file} within ${LOCK_ATTEMPTS * LOCK_WAIT_MS}ms ` +
+        `(holder ${lock}); refusing to write the receipt unprotected`,
+    );
+  }
+  try {
+    fn();
+  } finally {
+    try {
+      fs.rmdirSync(lock);
+    } catch {
+      /* already reclaimed as stale */
+    }
+  }
+}
+
+/**
+ * Record one observation about one recipient's copy of a message.
+ *
+ * Each recipient owns its own file, written atomically, so several sessions
+ * archiving the same message at the same moment cannot overwrite each other's
+ * `deliveredAt`. The single shared file this replaced lost that field whenever
+ * two writers interleaved, which made a delivered message read as `queued`
+ * forever — the one thing a receipt exists to get right.
+ *
+ * Two writers still touch one recipient's file: the sender recording `queuedAt`
+ * and the recipient recording `deliveredAt`. They cannot be ordered by
+ * construction, so the read-merge-write runs under a short exclusive lock on that
+ * one file. Verifying after an unlocked write is not enough: each side would only
+ * check its own field, and a later write could still erase a field the other side
+ * had already confirmed.
+ */
 function recordReceipt(paths: Paths, id: string, recipient: string, patch: Partial<Receipt>): void {
-  const file = receiptPath(paths, id);
-  const existing = readJson<{ id: string; receipts: Record<string, Receipt> }>(file) ?? {
-    id,
-    receipts: {},
-  };
-  const current = existing.receipts[recipient] ?? ({} as Receipt);
-  // Never move a timestamp backwards: a repeated call is not new information.
-  existing.receipts[recipient] = {
-    queuedAt: current.queuedAt ?? patch.queuedAt ?? new Date().toISOString(),
-    deliveredAt: current.deliveredAt ?? patch.deliveredAt,
-  };
-  writeJsonAtomic(file, existing);
+  if (!isValidName(recipient)) return;
+  const file = recipientReceiptPath(paths, id, recipient);
+  ensureDir(path.dirname(file));
+  withReceiptLock(file, () => {
+    const current = readJson<Receipt>(file) ?? legacyReceiptFor(paths, id, recipient) ?? ({} as Receipt);
+    // Never move a timestamp backwards: a repeated call is not new information.
+    writeJsonAtomic(file, {
+      queuedAt: current.queuedAt ?? patch.queuedAt ?? new Date().toISOString(),
+      deliveredAt: current.deliveredAt ?? patch.deliveredAt,
+      injectedAt: current.injectedAt ?? patch.injectedAt,
+    });
+  });
 }
 
 /** What the extension observed for one message, or null when it never saw it. */
@@ -503,19 +613,106 @@ export interface ReceiptRecord {
   receipts: Record<string, Receipt>;
 }
 
+/**
+ * What the extension observed for one message, merging both layouts.
+ *
+ * The recipient's own file wins where it has a timestamp, because it is the one
+ * still being written; the legacy single file is the fallback, and its extra
+ * recipients are carried across so a pre-migration record is never narrowed.
+ */
 export function readReceipts(paths: Paths, id: string): ReceiptRecord | null {
   if (!/^[0-9a-f-]{8,}$/i.test(id)) return null;
-  return readJson<ReceiptRecord>(receiptPath(paths, id));
+  const receipts: Record<string, Receipt> = {};
+  const legacy = readJson<ReceiptRecord>(receiptPath(paths, id));
+  if (legacy?.receipts != null && typeof legacy.receipts === "object") {
+    for (const [name, receipt] of Object.entries(legacy.receipts)) {
+      if (receipt != null) receipts[name] = { ...receipt };
+    }
+  }
+  const dir = receiptDirFor(paths, id);
+  let files: string[];
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    files = [];
+  }
+  for (const file of files) {
+    const name = file.slice(0, -5);
+    const per = readJson<Receipt>(path.join(dir, file));
+    if (per == null) continue;
+    const prior = receipts[name];
+    receipts[name] = {
+      queuedAt: per.queuedAt ?? prior?.queuedAt ?? new Date().toISOString(),
+      deliveredAt: per.deliveredAt ?? prior?.deliveredAt,
+      injectedAt: per.injectedAt ?? prior?.injectedAt,
+    };
+  }
+  if (Object.keys(receipts).length === 0) return null;
+  return { id, receipts };
+}
+
+/**
+ * Fold per-recipient receipts back into the pre-split single-file layout.
+ *
+ * This is the rollback path, not a runtime path: a build that only understands
+ * `receipts/<id>.json` would read every message delivered by this one as
+ * `queued`, because the per-recipient files are invisible to it. Merging them
+ * back — into any existing legacy record, never replacing it — makes rollback
+ * safe. Running it twice changes nothing.
+ */
+export function consolidateReceipts(paths: Paths): { messages: number; recipients: number } {
+  let messages = 0;
+  let recipients = 0;
+  let dirs: string[];
+  try {
+    dirs = fs
+      .readdirSync(paths.receipts, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return { messages: 0, recipients: 0 };
+  }
+  for (const id of dirs) {
+    if (!/^[0-9a-f-]{8,}$/i.test(id)) continue;
+    const dir = receiptDirFor(paths, id);
+    let files: string[];
+    try {
+      files = fs.readdirSync(dir).filter((file) => file.endsWith(".json"));
+    } catch {
+      continue;
+    }
+    if (files.length === 0) continue;
+    const legacy = readJson<ReceiptRecord>(receiptPath(paths, id)) ?? { id, receipts: {} };
+    if (legacy.receipts == null) legacy.receipts = {};
+    for (const file of files) {
+      const name = file.slice(0, -5);
+      if (!isValidName(name)) continue;
+      const per = readJson<Receipt>(path.join(dir, file));
+      if (per == null) continue;
+      const prior = legacy.receipts[name];
+      if (prior == null) recipients += 1;
+      legacy.receipts[name] = {
+        queuedAt: prior?.queuedAt ?? per.queuedAt ?? new Date().toISOString(),
+        deliveredAt: prior?.deliveredAt ?? per.deliveredAt,
+        injectedAt: prior?.injectedAt ?? per.injectedAt,
+      };
+    }
+    writeJsonAtomic(receiptPath(paths, id), { id, receipts: legacy.receipts });
+    messages += 1;
+  }
+  return { messages, recipients };
 }
 
 /**
  * Record that a recipient's session was handed a message.
  *
- * Called by the delivery loop immediately before `pi.sendMessage`, which is the
- * last moment the extension can observe anything.
+ * Called by {@link archive} *after* the handoff succeeded — `pi.sendMessage`, then
+ * this — so a receipt can never claim a delivery that did not happen. `injectedAt`
+ * is passed only by the flush that did the handoff, so a plain archive keeps its
+ * old signature.
  */
-export function markDelivered(paths: Paths, id: string, recipient: string): void {
-  recordReceipt(paths, id, recipient, { deliveredAt: new Date().toISOString() });
+export function markDelivered(paths: Paths, id: string, recipient: string, injectedAt?: string): void {
+  recordReceipt(paths, id, recipient, { deliveredAt: new Date().toISOString(), injectedAt });
 }
 
 /** Undelivered messages for one agent, oldest first. */
@@ -550,7 +747,13 @@ export function drain(paths: Paths, name: string): PendingMessage[] {
  * It is kept rather than deleted so `reply_all` can resolve a message id back
  * to its recipient set long after delivery.
  */
-export function archive(paths: Paths, name: string, file: string, message: Delivery): void {
+export function archive(
+  paths: Paths,
+  name: string,
+  file: string,
+  message: Delivery,
+  options: { injectedAt?: string } = {},
+): void {
   const readDir = path.join(inboxDir(paths, name), "read");
   ensureDir(readDir);
   const target = path.join(readDir, path.basename(file));
@@ -559,6 +762,10 @@ export function archive(paths: Paths, name: string, file: string, message: Deliv
     ...message,
     queuedAt: message.queuedAt ?? deliveredAt,
     deliveredAt: message.deliveredAt ?? deliveredAt,
+    // Additive: the flush records the handoff it made. Absent when something
+    // other than a flush archived the file (a test, or a future tool), which is
+    // exactly why it is optional rather than a state.
+    injectedAt: options.injectedAt ?? message.injectedAt,
   };
   try {
     fs.renameSync(file, target);
@@ -566,7 +773,7 @@ export function archive(paths: Paths, name: string, file: string, message: Deliv
     return;
   }
   writeJsonAtomic(path.join(readDir, `${message.id}.json`), stamped);
-  markDelivered(paths, message.id, name);
+  markDelivered(paths, message.id, name, options.injectedAt);
   pruneReadHistory(paths, name);
 }
 

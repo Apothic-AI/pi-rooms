@@ -17,6 +17,7 @@ import {
   archive,
   drain,
   readPosts,
+  readReceipts,
   readRoom,
   register,
   resolvePaths,
@@ -402,9 +403,10 @@ test("rooms_leave discards only this lane's queued messages for that room", asyn
     fs.existsSync(path.join(paths.inbox, "core", "read", `${delivered.message.id}.json`)),
     "the read/ archive is not a queue and survives",
   );
-  // Receipts are left alone: a discarded message was queued and never delivered.
-  const receipt = JSON.parse(fs.readFileSync(path.join(paths.receipts, `${delivered.message.id}.json`), "utf8"));
-  assert.equal(receipt.receipts.core.deliveredAt != null, true, "the archived one keeps its deliveredAt");
+  // Receipts are left alone: a discarded message was queued and never delivered,
+  // so the receipt for the copy that *was* archived keeps its deliveredAt.
+  const receipt = readReceipts(paths, delivered.message.id);
+  assert.equal(receipt?.receipts.core.deliveredAt != null, true, "the archived one keeps its deliveredAt");
 });
 
 test("discardQueued:false keeps the backlog, queued", async () => {

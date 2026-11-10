@@ -28,6 +28,19 @@ export interface RoomsConfig {
   dmDelivery: DeliveryMode;
   /** How a room post interrupts the receiver. */
   roomDelivery: DeliveryMode;
+  /**
+   * Most messages handed to the session in one flush.
+   *
+   * A backlog is delivered in bounded batches so a long absence cannot inject N
+   * transcripts (and N turns) into one moment. The remainder stays queued, in
+   * arrival order, for the next tick.
+   */
+  maxDeliverPerFlush: number;
+  /**
+   * Messages older than this are rendered with an explicit age prefix, so a
+   * catch-up cannot masquerade as fresh conversation.
+   */
+  staleAfterMs: number;
   /** Inbox fallback poll interval, for filesystems where watch is unreliable. */
   pollMs: number;
 }
@@ -38,6 +51,8 @@ export const DEFAULTS: RoomsConfig = {
   dmDelivery: "steer",
   roomDelivery: "followUp",
   pollMs: 2000,
+  maxDeliverPerFlush: 5,
+  staleAfterMs: 900_000,
 };
 
 export function configPath(paths: Paths): string {
@@ -73,5 +88,7 @@ export function loadConfig(paths: Paths): RoomsConfig {
     dmDelivery: delivery(input.dmDelivery, DEFAULTS.dmDelivery),
     roomDelivery: delivery(input.roomDelivery, DEFAULTS.roomDelivery),
     pollMs: number(input.pollMs, DEFAULTS.pollMs),
+    maxDeliverPerFlush: number(input.maxDeliverPerFlush, DEFAULTS.maxDeliverPerFlush),
+    staleAfterMs: number(input.staleAfterMs, DEFAULTS.staleAfterMs),
   };
 }
