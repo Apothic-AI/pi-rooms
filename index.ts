@@ -61,6 +61,8 @@ import { claimPin, listPins, pinPath, readPinFile, resolvePin, writePinFile } fr
 
 interface SessionState {
   name: string;
+  /** False until explicit join when autoJoin is disabled: name is only intent. */
+  joined: boolean;
   paths: Paths;
   config: RoomsConfig;
   sendsUsed: number;
@@ -75,6 +77,10 @@ interface SessionState {
   draining: boolean;
   /** Pin key the current name came from, when it came from a pin. */
   pinKey: string | null;
+  /** Last applied request; losing a competing holder is not a rename request. */
+  intent: string | null;
+  /** Targets already reported absent; reset when a send observes a live holder. */
+  absentNotices: Set<string>;
   /** Attributes captured once, from the environment of this process. */
   paneId: string | undefined;
   tabId: string | undefined;
@@ -154,33 +160,50 @@ export default function (pi: ExtensionAPI): void {
     if (explicit.length > 0) {
       const slug = slugify(explicit);
       if (isValidName(slug)) {
-        if (active.name !== slug) {
-          releaseClaimedName(active);
-          active.name = slug;
-          active.pinKey = null;
-        }
+        applyIntent(active, `env:${slug}`, slug, cwd);
+        active.pinKey = null;
         return;
       }
     }
-    const resolved = claimPin(active.paths, {
+    const resolved = resolvePin(active.paths, {
       sessionId: active.sessionId,
       paneId: active.paneId,
       cwd,
       pid: process.pid,
     });
-    if (resolved != null && resolved.name.length > 0 && resolved.name !== active.name) {
-      releaseClaimedName(active);
-      active.name = resolved.name;
+    if (resolved != null && resolved.name.length > 0) {
+      applyIntent(active, `pin:${resolved.key}:${resolved.name}`, resolved.name, cwd);
       active.pinKey = resolved.key;
+      if (active.joined && active.name === resolved.name) {
+        claimPin(active.paths, { sessionId: active.sessionId, paneId: active.paneId, cwd, pid: process.pid });
+      }
+    } else if (!active.joined) {
+      // Deferred names are requests, not entitlements. Rejection/removal of a
+      // previously eligible pin must discard it before any claim or delivery.
+      applyIntent(active, `derived:${cwd}`, defaultName(cwd), cwd);
+      active.pinKey = null;
     }
+  }
+
+  function applyIntent(active: SessionState, intent: string, desired: string, cwd: string): void {
+    if (!active.joined) {
+      active.name = desired;
+      active.intent = intent;
+      return;
+    }
+    if (active.intent === intent) return;
+    const name = claimName(active.paths, desired, process.pid, cwd);
+    if (name !== active.name) {
+      releaseClaimedName(active);
+      active.name = name;
+      putRegistration(active, cwd);
+    }
+    active.intent = intent;
   }
 
   /** Drop the previous name's registration so a rename leaves no ghost behind. */
   function releaseClaimedName(active: SessionState): void {
-    const existing = readRegistration(active.paths, active.name);
-    // Only remove it when it is ours; another process's registration of the
-    // same name is not this session's to delete.
-    if (existing != null && existing.pid === process.pid) unregister(active.paths, active.name);
+    if (active.joined) unregister(active.paths, active.name, process.pid);
   }
 
   function ensure(ctx: ExtensionContext): SessionState {
@@ -189,15 +212,16 @@ export default function (pi: ExtensionAPI): void {
       refreshName(session, ctx.cwd);
       // A pin can rename a running lane on its next tool call; the watcher has to
       // follow it or the lane goes deaf to its own inbox.
-      if (session.name !== previous) rebindWatcher(session, ctx, previous);
+      if (session.joined && session.name !== previous) rebindWatcher(session, ctx, previous);
       return session;
     }
     const paths = resolvePaths(resolveBase());
     const config = loadConfig(paths);
     const desired = defaultName(ctx.cwd);
-    const name = claimName(paths, desired, process.pid);
+    const name = config.autoJoin ? claimName(paths, desired, process.pid, ctx.cwd) : desired;
     session = {
       name,
+      joined: config.autoJoin,
       paths,
       config,
       sendsUsed: 0,
@@ -208,10 +232,12 @@ export default function (pi: ExtensionAPI): void {
       grace: new Map(),
       draining: false,
       pinKey: null,
+      intent: null,
+      absentNotices: new Set(),
       paneId: nonEmpty(process.env.HERDR_PANE_ID),
       tabId: nonEmpty(process.env.HERDR_TAB_ID),
       workspaceId: nonEmpty(process.env.HERDR_WORKSPACE_ID),
-      sessionId: nonEmpty(process.env.PI_SESSION_ID),
+      sessionId: nonEmpty(ctx.sessionManager?.getSessionId()) ?? nonEmpty(process.env.PI_SESSION_ID),
     };
     refreshName(session, ctx.cwd);
     return session;
@@ -244,24 +270,40 @@ export default function (pi: ExtensionAPI): void {
   }
 
   function join(ctx: ExtensionContext): SessionState {
+    // ensure resolves current inputs while still unjoined, including fallback
+    // when a cached pin is no longer eligible. Only then take the locked claim.
     const active = ensure(ctx);
+    const firstJoin = !active.joined;
+    if (firstJoin) {
+      active.name = claimName(active.paths, active.name, process.pid, ctx.cwd);
+      active.joined = true;
+      refreshName(active, ctx.cwd);
+    }
+    putRegistration(active, ctx.cwd);
+    if (firstJoin) {
+      startWatcher(ctx);
+      flush(ctx);
+    }
+    return active;
+  }
+
+  function putRegistration(active: SessionState, cwd: string): void {
     const entry: Registration = {
       name: active.name,
       pid: process.pid,
-      cwd: ctx.cwd,
+      cwd,
       bootId: bootId() ?? undefined,
       procId: procIdentity(process.pid) ?? undefined,
       paneId: active.paneId,
       tabId: active.tabId,
       workspaceId: active.workspaceId,
-      sessionId: process.env.PI_SESSION_ID,
+      sessionId: active.sessionId,
       model: process.env.PI_MODEL,
       startedAt: nowIso(),
       updatedAt: nowIso(),
     };
     const existing = listAgents(active.paths).find((a) => a.name === active.name);
     register(active.paths, { ...entry, startedAt: existing?.startedAt ?? entry.startedAt });
-    return active;
   }
 
   /**
@@ -290,6 +332,19 @@ export default function (pi: ExtensionAPI): void {
   // -------------------------------------------------------------------------
   // Delivery
   // -------------------------------------------------------------------------
+
+  /** A sender-side observation, not a delivery acknowledgement or queue policy. */
+  function queueMessage(active: SessionState, message: Delivery): { written: string[]; notice: string } {
+    const written = deliver(active.paths, message);
+    const live = new Set(listAgents(active.paths).map((agent) => agent.name));
+    for (const name of live) active.absentNotices.delete(name);
+    const absent = written.filter((name) => !live.has(name) && !active.absentNotices.has(name));
+    for (const name of absent) active.absentNotices.add(name);
+    return {
+      written,
+      notice: absent.length === 0 ? "" : `\nNo live holder observed for ${absent.join(", ")}. Queue preserved without expiry; this is not a delivery acknowledgement.`,
+    };
+  }
 
   function render(message: Delivery, staleAfterMs = Number.POSITIVE_INFINITY): string {
     const header =
@@ -324,7 +379,8 @@ export default function (pi: ExtensionAPI): void {
    * queued behind it, and a takeover can happen in that gap.
    */
   function canDrain(active: SessionState, name: string): boolean {
-    if (name === active.name) return true;
+    if (!active.joined) return false;
+    if (name === active.name) return readRegistration(active.paths, name)?.pid === process.pid;
     const grace = active.grace.get(name);
     if (grace == null || Date.now() >= grace.until) return false;
     return !listAgents(active.paths).some((agent) => agent.name === name && agent.pid !== process.pid);
@@ -491,7 +547,7 @@ export default function (pi: ExtensionAPI): void {
 
   function startWatcher(context: ExtensionContext): void {
     const active = session;
-    if (active == null || active.watcher != null) return;
+    if (active == null || !active.joined || active.watcher != null) return;
     openWatcher(active, context);
   }
 
@@ -589,7 +645,7 @@ export default function (pi: ExtensionAPI): void {
     const active = session;
     if (active == null) return;
     stopWatcher();
-    unregister(active.paths, active.name);
+    releaseClaimedName(active);
     session = null;
   });
 
@@ -738,7 +794,7 @@ export default function (pi: ExtensionAPI): void {
       if (appliesHere) {
         const previous = active.name;
         refreshName(active, ctx.cwd);
-        if (active.name !== previous) rebindWatcher(active, ctx, previous);
+        if (active.joined && active.name !== previous) rebindWatcher(active, ctx, previous);
         join(ctx);
       }
 
@@ -808,12 +864,12 @@ export default function (pi: ExtensionAPI): void {
         text: body,
         sentAt: nowIso(),
       };
-      const written = deliver(active.paths, message);
+      const { written, notice } = queueMessage(active, message);
       const missing = recipients.filter((r) => !written.includes(r));
       return text(
         `Queued to ${written.length} agent(s)${missing.length > 0 ? `; skipped ${missing.join(", ")}` : ""}. id ${message.id}\n` +
           `Queued is not delivered: each recipient's session records a deliveredAt when it is handed the message. ` +
-          `The receipts are per recipient under ${receiptDirFor(active.paths, message.id)}/.`,
+          `The receipts are per recipient under ${receiptDirFor(active.paths, message.id)}/.` + notice,
         { id: message.id, delivered: written, skipped: missing },
       );
     },
@@ -869,7 +925,7 @@ export default function (pi: ExtensionAPI): void {
           sentAt: nowIso(),
           recipients: room.members.filter((m) => m !== active.name),
         });
-        deliver(active.paths, {
+        const { notice } = queueMessage(active, {
           id: randomUUID(),
           from: active.name,
           to: room.members.filter((m) => m !== active.name),
@@ -879,7 +935,7 @@ export default function (pi: ExtensionAPI): void {
           roomSeq: seq,
           replyTo: original.id,
         });
-        return text(`Replied in room ${room.name} at #${seq}.`, { room: room.name, seq });
+        return text(`Replied in room ${room.name} at #${seq}.` + notice, { room: room.name, seq });
       }
       if (recipients.length === 0) return fail("That message had no other recipients to reply to.");
       const message: Delivery = {
@@ -890,8 +946,8 @@ export default function (pi: ExtensionAPI): void {
         sentAt: nowIso(),
         replyTo: original.id,
       };
-      const written = deliver(active.paths, message);
-      return text(`Replied to ${written.length} recipient(s): ${written.join(", ")}.`, {
+      const { written, notice } = queueMessage(active, message);
+      return text(`Replied to ${written.length} recipient(s): ${written.join(", ")}.` + notice, {
         id: message.id,
         delivered: written,
       });
@@ -1048,7 +1104,7 @@ export default function (pi: ExtensionAPI): void {
         sentAt: nowIso(),
         recipients,
       });
-      deliver(active.paths, {
+      const { notice } = queueMessage(active, {
         id: randomUUID(),
         from: active.name,
         to: recipients,
@@ -1057,7 +1113,7 @@ export default function (pi: ExtensionAPI): void {
         room: name,
         roomSeq: seq,
       });
-      return text(`Posted to ${name} as #${seq}, pushed to ${recipients.length} member(s).`, {
+      return text(`Posted to ${name} as #${seq}, pushed to ${recipients.length} member(s).` + notice, {
         room: name,
         seq,
         recipients,

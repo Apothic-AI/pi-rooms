@@ -83,8 +83,10 @@ Precedence, highest first:
    environment name. This is deliberate: the environment is a per-process
    instruction, and a file cannot speak for a process that already said what it
    is.
-2. `session:<PI_SESSION_ID>` — **the key to prefer.** It survives restarts of that
-   session, and survives its pane being moved, closed or recreated.
+2. `session:<session-id>` — **the key to prefer.** The extension reads the supported
+   `ctx.sessionManager.getSessionId()` API (`PI_SESSION_ID` is a fallback only).
+   Resume/reload keeps the id; `/new` and `/fork` create a new id, so do not inherit
+   the old session pin. The pin survives a resume in a new process or pane.
 3. `pane:<HERDR_PANE_ID>` — what you can see in the UI, but herdr **recycles pane
    ids**, so it is the convenient key and not the durable one.
 4. `cwd:<path>` — **only honoured when exactly one pi lane occupies that
@@ -97,13 +99,32 @@ Precedence, highest first:
 Session before pane is not arbitrary: a session id survives its pane being moved,
 closed or recreated, and a pane id survives nothing.
 
-**A pin is bound to the process that claimed it.** On first use the entry is
-stamped with that process's start time, and afterwards it only applies to a
-process matching that stamp. So a pin you wrote for `wE:p1B` is *not* silently
-inherited by the next process to occupy `wE:p1B`: the new occupant falls through
-to the next key, `rooms_pins` shows the pin as `claimed`, and you can free it by
-deleting the entry. Without that stamp, recycling a pane id would transfer one
-lane's identity to another, which is the failure this file exists to prevent.
+**Pane/cwd pins are bound to the claiming process.** On adoption they are stamped
+with that process's start time; a different process cannot inherit them. A
+`session:` pin is instead restart-safe and re-stamped when that session resumes.
+
+All name requests (explicit, pinned and derived) use an atomic presence claim. A
+live foreign holder wins: the contender gets a pid suffix without overwriting the
+holder or stamping a pin it did not take. The suffix stays for the session even
+if the holder exits; restart re-resolves it. A changed explicit name or pin is a
+new intent and re-registers immediately. Shutdown only removes our own entry.
+
+For cooperating writers on a shared filesystem with atomic `mkdir` and `rename`,
+presence claims, updates, stale pruning and guarded release serialize under a
+per-name atomic directory lock. Mixed/legacy or direct writers can bypass it;
+this is not a distributed-filesystem guarantee. An abandoned lock fails closed
+after a bounded wait; it is never reclaimed merely because it is old. After verifying no writer
+is alive, an operator can remove the abandoned `<base>/registry/<name>.lock`.
+Claims reserve presence before returning. With `autoJoin:false`, startup and
+inspection only resolve name intent: no registry entry, pin stamp, watcher or
+inbox drain is created until an explicit joining tool runs (for example
+`rooms_create` or `rooms_dm`). That join atomically claims an available name,
+publishes complete metadata and starts owned-inbox delivery; it never drains the
+unowned intent's inbox as a rename. Before joining, every resolution uses current
+inputs: a foreign-stamped, ambiguous or removed pin falls back to the derived
+name if no other eligible pin remains. First join resolves before claiming;
+already-joined lanes retain suffix stickiness. Collision suffixes, including retry
+counters, fit within the same 48-character name limit as unsuffixed names.
 
 ### Renaming a lane: leave-and-join
 
@@ -218,6 +239,12 @@ what a model does with a message once its session holds it, and a receipt that
 claimed more than it observed would be worse than no receipt at all. "Queued but
 not delivered" is a real and useful signal: it means the recipient's session is
 not running, or its inbox watcher never fired.
+
+When a send observes no live holder for a queued target, the sender's tool reply
+says so. The queue is preserved **without expiry, bounce, or deletion**; this is
+only a presence observation, not a delivery acknowledgement. The notice is once
+per target per sender session until a later send observes a live holder again.
+It adds no receipt state, background wake, or schema migration.
 
 ### Rooms
 

@@ -383,11 +383,8 @@ export function readRoster(paths: Paths): RosterEntry[] {
   for (const file of files) {
     const reg = readJson<Registration>(path.join(paths.registry, file));
     if (reg == null) {
-      try {
-        fs.unlinkSync(path.join(paths.registry, file));
-      } catch {
-        /* another process pruned it first */
-      }
+      // Do not unlink an unreadable file without the presence lock: a writer
+      // may be publishing it, and a later reader can diagnose it safely.
       continue;
     }
     roster.push({ ...reg, gone: livenessDiagnosis(reg) });
@@ -407,11 +404,10 @@ export function listAgents(paths: Paths): Registration[] {
   const live: Registration[] = [];
   for (const entry of readRoster(paths)) {
     if (entry.gone != null) {
-      try {
-        fs.unlinkSync(path.join(paths.registry, `${entry.name}.json`));
-      } catch {
-        /* another process pruned it first */
-      }
+      withPresenceLock(paths, entry.name, () => {
+        const current = readRegistration(paths, entry.name);
+        if (current != null && !isRegistrationLive(current)) unlinkRegistration(paths, entry.name);
+      });
       continue;
     }
     const { gone: _gone, ...registration } = entry;
@@ -427,28 +423,75 @@ export function listAgents(paths: Paths): Registration[] {
  * gets a suffixed variant instead. Two agents silently sharing one name would
  * merge two inboxes into one, which is the failure this prevents.
  */
-export function claimName(paths: Paths, desired: string, pid: number): string {
+export function claimName(paths: Paths, desired: string, pid: number, cwd = ""): string {
   const base = isValidName(desired) ? desired : slugify(desired);
-  let candidate = base;
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    const existing = readRegistration(paths, candidate);
-    if (existing == null || !isRegistrationLive(existing) || existing.pid === pid) return candidate;
-    candidate = `${base.slice(0, 44)}-${pid}`;
-    if (attempt > 0) candidate = `${base.slice(0, 40)}-${pid}-${attempt}`;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const suffix = attempt === 0 ? "" : attempt === 1 ? `-${pid}` : `-${pid}-${attempt - 1}`;
+    const candidate = `${base.slice(0, 48 - suffix.length)}${suffix}`;
+    const claimed = withPresenceLock(paths, candidate, () => {
+      const existing = readRegistration(paths, candidate);
+      if (existing != null && isRegistrationLive(existing) && existing.pid !== pid) return false;
+      if (existing?.pid === pid && isRegistrationLive(existing)) return true;
+      const at = new Date().toISOString();
+      // Reserve before returning, under the same lock as every presence mutation.
+      writeJsonAtomic(path.join(paths.registry, `${candidate}.json`), {
+        name: candidate, pid, cwd, bootId: bootId() ?? undefined,
+        procId: procIdentity(pid) ?? undefined, startedAt: at, updatedAt: at,
+      });
+      return true;
+    });
+    if (claimed) return candidate;
   }
-  return `${base.slice(0, 40)}-${pid}-${randomUUID().slice(0, 4)}`;
+  throw new Error(`pi-rooms: exhausted name claims for ${base}`);
+}
+
+/**
+ * Atomic mkdir serializes claim, refresh, prune and release for one name.
+ * Never reclaim by age: a paused writer is still an owner. An abandoned lock
+ * fails closed after a bounded wait, rather than risking two writers. Recovery
+ * requires removing that lock after verifying the writer is gone.
+ */
+function withPresenceLock<T>(paths: Paths, name: string, fn: () => T): T {
+  if (!isValidName(name)) throw new Error(`pi-rooms: invalid registration name ${name}`);
+  ensureDir(paths.registry);
+  const lock = path.join(paths.registry, `${name}.lock`);
+  let held = false;
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    try {
+      fs.mkdirSync(lock);
+      held = true;
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      sleepSync(1);
+    }
+  }
+  if (!held) throw new Error(`pi-rooms: presence lock busy or abandoned: ${lock}; refusing an unprotected write`);
+  try { return fn(); }
+  finally { fs.rmdirSync(lock); }
 }
 
 export function register(paths: Paths, entry: Registration): void {
-  writeJsonAtomic(path.join(paths.registry, `${entry.name}.json`), entry);
+  withPresenceLock(paths, entry.name, () => {
+    const existing = readRegistration(paths, entry.name);
+    if (existing != null && existing.pid !== entry.pid && isRegistrationLive(existing)) {
+      throw new Error(`pi-rooms: ${entry.name} is held by live pid ${existing.pid}`);
+    }
+    writeJsonAtomic(path.join(paths.registry, `${entry.name}.json`), entry);
+  });
 }
 
-export function unregister(paths: Paths, name: string): void {
-  try {
-    fs.unlinkSync(path.join(paths.registry, `${name}.json`));
-  } catch {
-    /* already gone */
-  }
+function unlinkRegistration(paths: Paths, name: string): void {
+  try { fs.unlinkSync(path.join(paths.registry, `${name}.json`)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+}
+
+/** When pid is supplied, compare-and-release under the same lock as claims. */
+export function unregister(paths: Paths, name: string, pid?: number): void {
+  withPresenceLock(paths, name, () => {
+    if (pid != null && readRegistration(paths, name)?.pid !== pid) return;
+    unlinkRegistration(paths, name);
+  });
 }
 
 // ---------------------------------------------------------------------------

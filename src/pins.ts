@@ -188,13 +188,13 @@ export function resolvePin(paths: Paths, ctx: ResolveContext): ResolvedPin | nul
       };
       continue;
     }
-    // A pin claimed by a different process has been inherited by this one: the
-    // pane or session key now belongs to someone else.
-    if (entry.procId != null && current != null && !sameProcessStart(entry.procId, current)) {
+    // Session ids survive resume in a new process; pane/cwd keys do not.
+    const inherited = entry.procId != null && current != null && !sameProcessStart(entry.procId, current);
+    if (inherited && !key.startsWith("session:")) {
       rejected = rejected ?? { key, reason: "pin was claimed by a different process" };
       continue;
     }
-    return { name: entry.name, key, claimed: entry.procId == null, rejected };
+    return { name: entry.name, key, claimed: entry.procId == null || inherited, rejected };
   }
   return rejected == null ? null : { name: "", key: "", claimed: false, rejected };
 }
